@@ -54,8 +54,7 @@ export default function DashboardPage() {
   const [securityPinInput, setSecurityPinInput] = useState('');
   const [storedPinHash, setStoredPinHash] = useState<string>('');
   const [feedbackMsg, setFeedbackMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
-  const [now, setNow] = useState<number>(Date.now());
-
+  const [now, setNow] = useState<number>(0);
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 15000);
     return () => clearInterval(timer);
