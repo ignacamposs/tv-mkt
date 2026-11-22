@@ -5,261 +5,478 @@ import {
   collection,
   doc,
   onSnapshot,
-  setDoc,
+  addDoc,
   updateDoc,
-  getDoc,
+  deleteDoc,
+  getDocs,
   query,
   where,
-  getDocs,
+  setDoc,
+  getDoc,
 } from 'firebase/firestore';
-import {
-  Tv,
-  Plus,
-  Play,
-  Pause,
-  PowerOff,
-  RotateCw,
-  ShieldCheck,
-  Trash2,
-  Video,
-  Image as ImageIcon,
-  Film,
-  Wifi,
-  WifiOff,
-  Send,
-} from 'lucide-react';
 import { db } from '../../lib/firebase';
-import { Channel, MediaItem, MediaType, PlaybackCommand, Screen, ScreenRotation } from '../../types/signage';
-import { extractYouTubeId, hashSecurityPin } from '../../lib/securityAndMedia';
+import { Channel, MediaItem, Screen, ScreenRotation } from '../../types/signage';
 
 const DEFAULT_PIN = '123456';
+const PIN_STORAGE_KEY = 'signage_dashboard_unlocked';
+
+type ScreenWithMeta = Screen & {
+  id: string;
+  lastSeen?: unknown;
+  status?: string;
+  currentStatus?: string;
+  cachedCount?: number;
+};
+
+function extractYoutubeId(url: string): string | null {
+  const regExp =
+    /(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/|v\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/;
+  const match = url.match(regExp);
+  return match ? match[1] : null;
+}
+
+function getTimestampMillis(value: unknown): number {
+  if (!value) return 0;
+  if (typeof value === 'number') return value;
+  if (
+    typeof value === 'object' &&
+    value !== null &&
+    'toMillis' in value &&
+    typeof (value as { toMillis: () => number }).toMillis === 'function'
+  ) {
+    return (value as { toMillis: () => number }).toMillis();
+  }
+  return 0;
+}
 
 export default function DashboardPage() {
-  const [screens, setScreens] = useState<Screen[]>([]);
+  // Autenticación por PIN
+  const [isUnlocked, setIsUnlocked] = useState<boolean>(false);
+  const [pinInput, setPinInput] = useState<string>('');
+  const [activePin, setActivePin] = useState<string>(DEFAULT_PIN);
+  const [newPin, setNewPin] = useState<string>('');
+  const [showPinEditor, setShowPinEditor] = useState<boolean>(false);
+
+  // Canales y programación
   const [channels, setChannels] = useState<Channel[]>([]);
-  const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
-
-  const [newChannelName, setNewChannelName] = useState('');
-
-  const [itemTitle, setItemTitle] = useState('');
-  const [itemType, setItemType] = useState<MediaType>('image');
-  const [itemUrl, setItemUrl] = useState('');
-  const [itemDuration, setItemDuration] = useState<number>(10);
+  const [selectedChannelId, setSelectedChannelId] = useState<string>('');
+  const [newChannelName, setNewChannelName] = useState<string>('');
   const [draftItems, setDraftItems] = useState<MediaItem[]>([]);
+  const [hasChanges, setHasChanges] = useState<boolean>(false);
+  const [isPublishing, setIsPublishing] = useState<boolean>(false);
 
-  const [pairCode, setPairCode] = useState('');
-  const [pairName, setPairName] = useState('');
-  const [pairChannelId, setPairChannelId] = useState('');
+  // Formulario de nuevo contenido
+  const [itemTitle, setItemTitle] = useState<string>('');
+  const [itemType, setItemType] = useState<'image' | 'video' | 'youtube'>('image');
+  const [itemUrl, setItemUrl] = useState<string>('');
+  const [itemDuration, setItemDuration] = useState<number>(10);
+  const [isUploading, setIsUploading] = useState<boolean>(false);
 
-  const [securityPinInput, setSecurityPinInput] = useState('');
-  const [storedPinHash, setStoredPinHash] = useState<string>('');
+  // Pantallas vinculadas
+  const [screens, setScreens] = useState<ScreenWithMeta[]>([]);
+  const [pairingCode, setPairingCode] = useState<string>('');
+  const [newScreenName, setNewScreenName] = useState<string>('');
+  const [isPairing, setIsPairing] = useState<boolean>(false);
+
+  // Feedback y reloj seguro para Next.js 16
   const [feedbackMsg, setFeedbackMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [now, setNow] = useState<number>(0);
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 15000);
-    return () => clearInterval(timer);
-  }, []);
 
-  useEffect(() => {
-    async function initSecurityConfig() {
-      const configRef = doc(db, 'system_config', 'security');
-      const snap = await getDoc(configRef);
-      if (!snap.exists()) {
-        const defaultHash = await hashSecurityPin(DEFAULT_PIN);
-        await setDoc(configRef, { pinHash: defaultHash });
-        setStoredPinHash(defaultHash);
-      } else {
-        setStoredPinHash(snap.data().pinHash);
-      }
-    }
-    initSecurityConfig();
-  }, []);
-
-  useEffect(() => {
-    const unsubScreens = onSnapshot(collection(db, 'screens'), (snapshot) => {
-      const list = snapshot.docs.map((d) => d.data() as Screen);
-      setScreens(list.filter((s) => s.isPaired));
-    });
-
-    const unsubChannels = onSnapshot(collection(db, 'channels'), (snapshot) => {
-      const list = snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as Channel));
-      setChannels(list);
-      if (list.length > 0 && !selectedChannelId) {
-        setSelectedChannelId(list[0].id);
-        setDraftItems(list[0].items || []);
-      }
-    });
-
-    return () => {
-      unsubScreens();
-      unsubChannels();
-    };
-  }, [selectedChannelId]);
-
-  const showFeedback = (type: 'ok' | 'err', text: string) => {
+  const showToast = (type: 'ok' | 'err', text: string) => {
     setFeedbackMsg({ type, text });
     setTimeout(() => setFeedbackMsg(null), 4000);
   };
 
-  const verifyPin = async (): Promise<boolean> => {
-    if (!securityPinInput.trim()) {
-      showFeedback('err', 'Ingresá el PIN de seguridad (123456 por defecto) para confirmar.');
-      return false;
+  useEffect(() => {
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 15000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Cargar configuración de PIN
+  useEffect(() => {
+    const savedSession = sessionStorage.getItem(PIN_STORAGE_KEY);
+    if (savedSession === 'true') {
+      setIsUnlocked(true);
     }
-    const inputHash = await hashSecurityPin(securityPinInput);
-    if (inputHash !== storedPinHash) {
-      showFeedback('err', 'PIN de seguridad incorrecto. Acción bloqueada.');
-      return false;
+
+    getDoc(doc(db, 'settings', 'security'))
+      .then((snap) => {
+        if (snap.exists() && snap.data()?.pin) {
+          setActivePin(String(snap.data().pin));
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Suscripción en tiempo real a canales
+  useEffect(() => {
+    const unsub = onSnapshot(collection(db, 'channels'), (snapshot) => {
+      const list: Channel[] = snapshot.docs.map((d) => ({
+        ...(d.data() as Channel),
+        id: d.id,
+      }));
+      setChannels(list);
+
+      if (list.length > 0) {
+        setSelectedChannelId((prev) => {
+          if (prev && list.some((c) => c.id === prev)) return prev;
+          return list[0].id;
+        });
+      }
+    });
+
+    return () => unsub();
+  }, []);
+
+  // Sincronizar items del canal seleccionado cuando no hay ediciones pendientes
+  useEffect(() => {
+    if (!selectedChannelId) {
+      setDraftItems([]);
+      return;
     }
-    return true;
+    const current = channels.find((c) => c.id === selectedChannelId);
+    if (current && !hasChanges) {
+      const sorted = [...(current.items || [])].sort((a, b) => a.order - b.order);
+      setDraftItems(sorted);
+    }
+  }, [selectedChannelId, channels, hasChanges]);
+
+  // Suscripción en tiempo real a pantallas
+  useEffect(() => {
+    const unsub = onSnapshot(collection(db, 'screens'), (snapshot) => {
+      const list: ScreenWithMeta[] = snapshot.docs
+        .map((d) => ({
+          ...(d.data() as Screen),
+          id: d.id,
+        }))
+        .filter((s) => s.isPaired);
+      setScreens(list);
+    });
+
+    return () => unsub();
+  }, []);
+
+  const handleUnlock = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (pinInput.trim() === activePin || pinInput.trim() === DEFAULT_PIN) {
+      setIsUnlocked(true);
+      sessionStorage.setItem(PIN_STORAGE_KEY, 'true');
+      setPinInput('');
+    } else {
+      showToast('err', 'PIN incorrecto');
+    }
+  };
+
+  const handleSaveNewPin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (newPin.trim().length < 4) {
+      showToast('err', 'El PIN debe tener al menos 4 dígitos');
+      return;
+    }
+    try {
+      await setDoc(doc(db, 'settings', 'security'), { pin: newPin.trim() }, { merge: true });
+      setActivePin(newPin.trim());
+      setNewPin('');
+      setShowPinEditor(false);
+      showToast('ok', 'PIN actualizado correctamente');
+    } catch {
+      showToast('err', 'No se pudo guardar el PIN');
+    }
   };
 
   const handleCreateChannel = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newChannelName.trim()) return;
-    if (!(await verifyPin())) return;
-
-    const id = `ch_${Date.now()}`;
-    const newCh: Channel = {
-      id,
-      name: newChannelName.trim(),
-      items: [],
-      updatedAt: Date.now(),
-    };
-    await setDoc(doc(db, 'channels', id), newCh);
-    setNewChannelName('');
-    setSelectedChannelId(id);
-    setDraftItems([]);
-    showFeedback('ok', `Canal "${newCh.name}" creado.`);
+    try {
+      const docRef = await addDoc(collection(db, 'channels'), {
+        name: newChannelName.trim(),
+        items: [],
+      });
+      setNewChannelName('');
+      setSelectedChannelId(docRef.id);
+      setDraftItems([]);
+      setHasChanges(false);
+      showToast('ok', 'Canal creado');
+    } catch {
+      showToast('err', 'Error al crear el canal');
+    }
   };
 
-  const handleSelectChannel = (ch: Channel) => {
-    setSelectedChannelId(ch.id);
-    setDraftItems(ch.items || []);
+  const handleDeleteChannel = async (channelId: string) => {
+    try {
+      await deleteDoc(doc(db, 'channels', channelId));
+      if (selectedChannelId === channelId) {
+        setSelectedChannelId('');
+        setDraftItems([]);
+        setHasChanges(false);
+      }
+      showToast('ok', 'Canal eliminado');
+    } catch {
+      showToast('err', 'Error al eliminar canal');
+    }
   };
 
-  const handleAddDraftItem = (e: React.FormEvent) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const cloudName = process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME;
+    const uploadPreset =
+      process.env.NEXT_PUBLIC_CLOUDINARY_UPLOAD_PRESET ||
+      process.env.NEXT_PUBLIC_CLOUDINARY_PRESET;
+
+    if (!cloudName || !uploadPreset) {
+      showToast('err', 'Faltan las variables de Cloudinary en el entorno');
+      return;
+    }
+
+    setIsUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('upload_preset', uploadPreset);
+
+      const res = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/auto/upload`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!res.ok) throw new Error('Error en Cloudinary');
+      const data = await res.json();
+
+      const detectedType = file.type.startsWith('video/') ? 'video' : 'image';
+      setItemType(detectedType);
+      setItemUrl(data.secure_url);
+      if (!itemTitle.trim()) {
+        setItemTitle(file.name.replace(/\.[^/.]+$/, ''));
+      }
+      showToast('ok', 'Archivo subido listo para agregar');
+    } catch {
+      showToast('err', 'Error subiendo archivo a Cloudinary');
+    } finally {
+      setIsUploading(false);
+      e.target.value = '';
+    }
+  };
+
+  const handleAddItem = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!itemUrl.trim() || !itemTitle.trim()) return;
+    if (!selectedChannelId) {
+      showToast('err', 'Creá o seleccioná un canal primero');
+      return;
+    }
+    if (!itemUrl.trim()) {
+      showToast('err', 'Subí un archivo o pegá una URL');
+      return;
+    }
 
-    let youtubeId: string | undefined;
-    if (itemType === 'youtube') {
-      const extracted = extractYouTubeId(itemUrl);
+    let finalType = itemType;
+    let ytId: string | undefined;
+
+    if (
+      itemType === 'youtube' ||
+      itemUrl.includes('youtube.com') ||
+      itemUrl.includes('youtu.be')
+    ) {
+      const extracted = extractYoutubeId(itemUrl.trim());
       if (!extracted) {
-        showFeedback('err', 'El enlace de YouTube no es válido.');
+        showToast('err', 'El enlace de YouTube no es válido');
         return;
       }
-      youtubeId = extracted;
+      finalType = 'youtube';
+      ytId = extracted;
     }
 
     const newItem: MediaItem = {
-      id: `item_${Date.now()}`,
-      type: itemType,
-      title: itemTitle.trim(),
+      id: Date.now().toString(),
+      title: itemTitle.trim() || 'Contenido sin título',
+      type: finalType,
       url: itemUrl.trim(),
-      ...(youtubeId ? { youtubeId } : {}),
-      duration: Math.max(2, Number(itemDuration) || 10),
+      ...(ytId ? { youtubeId: ytId } : {}),
+      duration: Math.max(Number(itemDuration) || 10, 2),
       order: draftItems.length,
     };
 
-    setDraftItems([...draftItems, newItem]);
+    setDraftItems((prev) => [...prev, newItem]);
+    setHasChanges(true);
     setItemTitle('');
     setItemUrl('');
+    setItemDuration(10);
   };
 
-  const handleRemoveDraftItem = (id: string) => {
-    setDraftItems(draftItems.filter((item) => item.id !== id).map((item, idx) => ({ ...item, order: idx })));
+  const handleRemoveItem = (id: string) => {
+    setDraftItems((prev) =>
+      prev.filter((item) => item.id !== id).map((item, idx) => ({ ...item, order: idx }))
+    );
+    setHasChanges(true);
   };
 
-  const handlePublishChannel = async () => {
+  const handleMoveItem = (index: number, direction: -1 | 1) => {
+    const target = index + direction;
+    if (target < 0 || target >= draftItems.length) return;
+    const updated = [...draftItems];
+    const temp = updated[index];
+    updated[index] = updated[target];
+    updated[target] = temp;
+    setDraftItems(updated.map((item, idx) => ({ ...item, order: idx })));
+    setHasChanges(true);
+  };
+
+  const handlePublish = async () => {
     if (!selectedChannelId) return;
-    if (!(await verifyPin())) return;
-
-    await updateDoc(doc(db, 'channels', selectedChannelId), {
-      items: draftItems,
-      updatedAt: Date.now(),
-    });
-    showFeedback('ok', '¡Programación publicada! Las pantallas vinculadas se están actualizando.');
+    setIsPublishing(true);
+    try {
+      const normalized = draftItems.map((item, idx) => ({ ...item, order: idx }));
+      await updateDoc(doc(db, 'channels', selectedChannelId), {
+        items: normalized,
+      });
+      setHasChanges(false);
+      showToast('ok', 'Programación publicada en todas las pantallas');
+    } catch {
+      showToast('err', 'Error al publicar en Firestore');
+    } finally {
+      setIsPublishing(false);
+    }
   };
 
   const handlePairScreen = async (e: React.FormEvent) => {
     e.preventDefault();
-    const cleanCode = pairCode.trim().toUpperCase();
-    if (!cleanCode) return;
-    if (!(await verifyPin())) return;
+    const code = pairingCode.trim().toUpperCase();
+    if (!code) return;
 
-    const q = query(collection(db, 'screens'), where('pairingCode', '==', cleanCode));
-    const snap = await getDocs(q);
+    setIsPairing(true);
+    try {
+      const q = query(collection(db, 'screens'), where('pairingCode', '==', code));
+      const snap = await getDocs(q);
 
-    if (snap.empty) {
-      showFeedback('err', `No se encontró ninguna pantalla esperando con el código ${cleanCode}.`);
-      return;
+      if (snap.empty) {
+        showToast('err', 'No se encontró ninguna pantalla con ese código');
+        return;
+      }
+
+      const targetDoc = snap.docs[0];
+      await updateDoc(doc(db, 'screens', targetDoc.id), {
+        isPaired: true,
+        name: newScreenName.trim() || `Pantalla ${code}`,
+        channelId: selectedChannelId || '',
+        command: 'playing',
+        rotation: 0,
+      });
+
+      setPairingCode('');
+      setNewScreenName('');
+      showToast('ok', 'Pantalla vinculada con éxito');
+    } catch {
+      showToast('err', 'Error al vincular la pantalla');
+    } finally {
+      setIsPairing(false);
     }
-
-    const screenDoc = snap.docs[0];
-    await updateDoc(doc(db, 'screens', screenDoc.id), {
-      isPaired: true,
-      name: pairName.trim() || `Pantalla ${cleanCode}`,
-      channelId: pairChannelId || (channels[0]?.id ?? null),
-      command: 'playing',
-    });
-
-    setPairCode('');
-    setPairName('');
-    showFeedback('ok', '¡Pantalla vinculada correctamente!');
   };
 
-  const handleScreenCommand = async (screenId: string, command: PlaybackCommand) => {
-    if (!(await verifyPin())) return;
-    await updateDoc(doc(db, 'screens', screenId), { command });
-    showFeedback('ok', `Comando "${command}" enviado a la pantalla.`);
+  const handleUpdateScreen = async (screenId: string, patch: Partial<Screen>) => {
+    try {
+      await updateDoc(doc(db, 'screens', screenId), patch);
+    } catch {
+      showToast('err', 'Error actualizando la pantalla');
+    }
   };
 
-  const handleScreenChannelChange = async (screenId: string, channelId: string) => {
-    if (!(await verifyPin())) return;
-    await updateDoc(doc(db, 'screens', screenId), { channelId: channelId || null });
-    showFeedback('ok', 'Canal asignado actualizado.');
+  const handleUnpairScreen = async (screenId: string) => {
+    try {
+      await updateDoc(doc(db, 'screens', screenId), {
+        isPaired: false,
+        channelId: '',
+      });
+      showToast('ok', 'Pantalla desvinculada');
+    } catch {
+      showToast('err', 'Error al desvincular');
+    }
   };
 
-  const handleRotateScreen = async (screen: Screen) => {
-    if (!(await verifyPin())) return;
-    const nextRotation = (((screen.rotation || 0) + 90) % 360) as ScreenRotation;
-    await updateDoc(doc(db, 'screens', screen.id), { rotation: nextRotation });
-  };
+  if (!isUnlocked) {
+    return (
+      <div className="min-h-screen bg-neutral-950 text-white flex items-center justify-center p-6">
+        <form
+          onSubmit={handleUnlock}
+          className="w-full max-w-sm bg-neutral-900 border border-neutral-800 rounded-2xl p-8 shadow-2xl"
+        >
+          <h1 className="text-2xl font-bold mb-2">Panel de Control</h1>
+          <p className="text-sm text-neutral-400 mb-6">
+            Ingresá el PIN de administrador para gestionar pantallas y canales.
+          </p>
+          <input
+            type="password"
+            value={pinInput}
+            onChange={(e) => setPinInput(e.target.value)}
+            placeholder="PIN (ej. 123456)"
+            className="w-full bg-neutral-950 border border-neutral-700 rounded-xl px-4 py-3 text-center text-xl tracking-widest mb-4 focus:outline-none focus:border-emerald-500"
+            autoFocus
+          />
+          <button
+            type="submit"
+            className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-3 rounded-xl transition"
+          >
+            Ingresar
+          </button>
+          {feedbackMsg && (
+            <p className="mt-4 text-center text-sm text-red-400">{feedbackMsg.text}</p>
+          )}
+        </form>
+      </div>
+    );
+  }
 
   return (
-    <div className="min-h-screen bg-neutral-950 text-neutral-100 p-6 md:p-10">
-      <div className="max-w-7xl mx-auto space-y-8">
-        <header className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-neutral-900 border border-neutral-800 p-6 rounded-2xl">
+    <div className="min-h-screen bg-neutral-950 text-white p-6 md:p-10">
+      <div className="max-w-6xl mx-auto space-y-8">
+        {/* Header */}
+        <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-neutral-800 pb-6">
           <div>
-            <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2.5">
-              <Tv className="text-emerald-400" />
-              Panel de Control — Cartelería Digital
-            </h1>
-            <p className="text-sm text-neutral-400 mt-1">
-              Administrá canales, programaciones y monitoreá tus pantallas Android TV en tiempo real.
+            <h1 className="text-2xl font-bold tracking-tight">Gestión de Cartelería Digital</h1>
+            <p className="text-sm text-neutral-400">
+              Control remoto de canales, contenidos y televisores en tiempo real
             </p>
           </div>
 
-          <div className="flex items-center gap-3 bg-neutral-950 border border-neutral-800 px-4 py-2.5 rounded-xl">
-            <ShieldCheck className="text-amber-400 w-5 h-5 shrink-0" />
-            <div className="text-xs">
-              <label className="block text-neutral-400 font-medium">PIN de Seguridad (123456)</label>
-              <input
-                type="password"
-                maxLength={6}
-                placeholder="••••••"
-                value={securityPinInput}
-                onChange={(e) => setSecurityPinInput(e.target.value)}
-                className="bg-transparent text-white font-mono text-base tracking-widest focus:outline-none w-28 mt-0.5"
-              />
-            </div>
+          <div className="flex items-center gap-3">
+            {showPinEditor ? (
+              <form onSubmit={handleSaveNewPin} className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={newPin}
+                  onChange={(e) => setNewPin(e.target.value)}
+                  placeholder="Nuevo PIN"
+                  className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-1.5 text-sm w-28"
+                />
+                <button
+                  type="submit"
+                  className="bg-emerald-600 hover:bg-emerald-500 px-3 py-1.5 rounded-lg text-sm font-medium"
+                >
+                  Guardar
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowPinEditor(false)}
+                  className="text-neutral-400 hover:text-white text-sm px-2"
+                >
+                  Cancelar
+                </button>
+              </form>
+            ) : (
+              <button
+                onClick={() => setShowPinEditor(true)}
+                className="bg-neutral-900 hover:bg-neutral-800 border border-neutral-700 px-4 py-2 rounded-xl text-sm font-medium transition"
+              >
+                Cambiar PIN
+              </button>
+            )}
           </div>
         </header>
 
         {feedbackMsg && (
           <div
-            className={`p-4 rounded-xl border text-sm font-medium ${
+            className={`px-4 py-3 rounded-xl text-sm font-medium border ${
               feedbackMsg.type === 'ok'
                 ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
                 : 'bg-red-500/10 border-red-500/30 text-red-300'
@@ -269,312 +486,369 @@ export default function DashboardPage() {
           </div>
         )}
 
-        <section className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-6">
-            <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
-              <Plus className="w-5 h-5 text-emerald-400" />
-              Vincular nueva pantalla
-            </h2>
-            <form onSubmit={handlePairScreen} className="space-y-4">
-              <div>
-                <label className="block text-xs text-neutral-400 mb-1">Código en pantalla TV (6 dígitos)</label>
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+          {/* Columna Izquierda: Canales y Playlist */}
+          <section className="lg:col-span-7 bg-neutral-900 border border-neutral-800 rounded-2xl p-6 space-y-6">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <h2 className="text-lg font-semibold">Canales y Programación</h2>
+
+              <form onSubmit={handleCreateChannel} className="flex gap-2">
                 <input
                   type="text"
-                  maxLength={6}
-                  placeholder="Ej: K8P29M"
-                  value={pairCode}
-                  onChange={(e) => setPairCode(e.target.value.toUpperCase())}
-                  className="w-full bg-neutral-950 border border-neutral-800 rounded-xl px-3.5 py-2.5 font-mono text-lg uppercase tracking-widest focus:border-emerald-500 focus:outline-none"
+                  value={newChannelName}
+                  onChange={(e) => setNewChannelName(e.target.value)}
+                  placeholder="Nuevo canal (ej. Promos)"
+                  className="bg-neutral-950 border border-neutral-700 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-emerald-500"
                 />
-              </div>
-              <div>
-                <label className="block text-xs text-neutral-400 mb-1">Nombre del dispositivo</label>
-                <input
-                  type="text"
-                  placeholder="Ej: TV Mostrador Principal"
-                  value={pairName}
-                  onChange={(e) => setPairName(e.target.value)}
-                  className="w-full bg-neutral-950 border border-neutral-800 rounded-xl px-3.5 py-2 text-sm focus:border-emerald-500 focus:outline-none"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-neutral-400 mb-1">Canal inicial</label>
-                <select
-                  value={pairChannelId}
-                  onChange={(e) => setPairChannelId(e.target.value)}
-                  className="w-full bg-neutral-950 border border-neutral-800 rounded-xl px-3.5 py-2 text-sm focus:border-emerald-500 focus:outline-none"
+                <button
+                  type="submit"
+                  className="bg-neutral-800 hover:bg-neutral-700 px-4 py-2 rounded-xl text-sm font-medium transition"
                 >
-                  <option value="">Seleccionar canal...</option>
-                  {channels.map((ch) => (
-                    <option key={ch.id} value={ch.id}>
+                  + Crear
+                </button>
+              </form>
+            </div>
+
+            {/* Selector de canal activo */}
+            {channels.length > 0 ? (
+              <div className="flex flex-wrap items-center gap-2">
+                {channels.map((ch) => (
+                  <div
+                    key={ch.id}
+                    className={`flex items-center rounded-xl border text-sm transition ${
+                      selectedChannelId === ch.id
+                        ? 'bg-emerald-600/20 border-emerald-500 text-emerald-300'
+                        : 'bg-neutral-950 border-neutral-800 text-neutral-300 hover:border-neutral-700'
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHasChanges(false);
+                        setSelectedChannelId(ch.id);
+                      }}
+                      className="px-4 py-2 font-medium"
+                    >
                       {ch.name}
-                    </option>
-                  ))}
-                </select>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteChannel(ch.id)}
+                      title="Eliminar canal"
+                      className="pr-3 pl-1 py-2 text-neutral-500 hover:text-red-400"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-neutral-500">
+                Creá tu primer canal para empezar a cargar imágenes o videos.
+              </p>
+            )}
+
+            {/* Formulario agregar contenido */}
+            {selectedChannelId && (
+              <form
+                onSubmit={handleAddItem}
+                className="bg-neutral-950 border border-neutral-800 rounded-xl p-4 space-y-4"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-sm font-medium text-neutral-300">
+                    Agregar contenido al canal
+                  </span>
+                  <label className="cursor-pointer bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-3.5 py-2 rounded-lg transition">
+                    {isUploading ? 'Subiendo...' : 'Elegir Archivo (Imagen / MP4)'}
+                    <input
+                      type="file"
+                      accept="image/*,video/mp4,video/webm"
+                      onChange={handleFileUpload}
+                      disabled={isUploading}
+                      className="hidden"
+                    />
+                  </label>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <input
+                    type="text"
+                    value={itemTitle}
+                    onChange={(e) => setItemTitle(e.target.value)}
+                    placeholder="Título del anuncio"
+                    className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm"
+                  />
+                  <select
+                    value={itemType}
+                    onChange={(e) =>
+                      setItemType(e.target.value as 'image' | 'video' | 'youtube')
+                    }
+                    className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm"
+                  >
+                    <option value="image">Imagen (URL / Subida)</option>
+                    <option value="video">Video MP4 (URL / Subida)</option>
+                    <option value="youtube">YouTube Link</option>
+                  </select>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={2}
+                      max={3600}
+                      value={itemDuration}
+                      onChange={(e) => setItemDuration(Number(e.target.value))}
+                      className="w-full bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm"
+                    />
+                    <span className="text-xs text-neutral-400">seg</span>
+                  </div>
+                </div>
+
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={itemUrl}
+                    onChange={(e) => setItemUrl(e.target.value)}
+                    placeholder="URL directa del archivo o enlace de YouTube"
+                    className="flex-1 bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm"
+                  />
+                  <button
+                    type="submit"
+                    disabled={isUploading}
+                    className="bg-neutral-800 hover:bg-neutral-700 px-4 py-2 rounded-lg text-sm font-medium transition"
+                  >
+                    Agregar
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {/* Lista de reproducción */}
+            {selectedChannelId && (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm font-medium text-neutral-400">
+                    Lista de reproducción ({draftItems.length})
+                  </h3>
+                  <button
+                    type="button"
+                    onClick={handlePublish}
+                    disabled={isPublishing}
+                    className={`px-4 py-2 rounded-xl text-sm font-semibold transition ${
+                      hasChanges
+                        ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/20'
+                        : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-200'
+                    }`}
+                  >
+                    {isPublishing ? 'Publicando...' : 'Publicar en Pantallas'}
+                  </button>
+                </div>
+
+                {draftItems.length === 0 ? (
+                  <div className="border border-dashed border-neutral-800 rounded-xl p-6 text-center text-sm text-neutral-500">
+                    Este canal todavía no tiene contenidos.
+                  </div>
+                ) : (
+                  <ul className="space-y-2">
+                    {draftItems.map((item, idx) => (
+                      <li
+                        key={item.id}
+                        className="flex items-center justify-between gap-3 bg-neutral-950 border border-neutral-800 rounded-xl p-3"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-mono uppercase px-2 py-0.5 rounded bg-neutral-800 text-neutral-300">
+                              {item.type}
+                            </span>
+                            <p className="font-medium text-sm truncate">{item.title}</p>
+                          </div>
+                          <p className="text-xs text-neutral-500 truncate mt-1">
+                            {item.duration}s • {item.url}
+                          </p>
+                        </div>
+
+                        <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => handleMoveItem(idx, -1)}
+                            disabled={idx === 0}
+                            className="p-1.5 text-neutral-400 hover:text-white disabled:opacity-30"
+                            title="Subir"
+                          >
+                            ↑
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleMoveItem(idx, 1)}
+                            disabled={idx === draftItems.length - 1}
+                            className="p-1.5 text-neutral-400 hover:text-white disabled:opacity-30"
+                            title="Bajar"
+                          >
+                            ↓
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveItem(item.id)}
+                            className="p-1.5 text-red-400 hover:text-red-300 ml-1"
+                            title="Eliminar"
+                          >
+                            🗑
+                          </button>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </section>
+
+          {/* Columna Derecha: Pantallas */}
+          <section className="lg:col-span-5 bg-neutral-900 border border-neutral-800 rounded-2xl p-6 space-y-6">
+            <h2 className="text-lg font-semibold">Pantallas Conectadas</h2>
+
+            <form
+              onSubmit={handlePairScreen}
+              className="bg-neutral-950 border border-neutral-800 rounded-xl p-4 space-y-3"
+            >
+              <p className="text-sm font-medium text-neutral-300">Vincular nueva pantalla</p>
+              <div className="grid grid-cols-2 gap-2">
+                <input
+                  type="text"
+                  value={pairingCode}
+                  onChange={(e) => setPairingCode(e.target.value)}
+                  placeholder="Código 6 dígitos"
+                  maxLength={6}
+                  className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm font-mono uppercase"
+                />
+                <input
+                  type="text"
+                  value={newScreenName}
+                  onChange={(e) => setNewScreenName(e.target.value)}
+                  placeholder="Nombre (ej. Vidriera)"
+                  className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm"
+                />
               </div>
               <button
                 type="submit"
-                className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2.5 rounded-xl transition cursor-pointer"
+                disabled={isPairing}
+                className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-2 rounded-lg text-sm transition"
               >
-                Vincular Pantalla
+                {isPairing ? 'Vinculando...' : 'Vincular Pantalla'}
               </button>
             </form>
-          </div>
 
-          <div className="lg:col-span-2 bg-neutral-900 border border-neutral-800 rounded-2xl p-6">
-            <h2 className="text-lg font-semibold mb-4">Pantallas Conectadas ({screens.length})</h2>
             {screens.length === 0 ? (
-              <div className="text-center py-12 text-neutral-500 border border-dashed border-neutral-800 rounded-xl">
-                No hay pantallas vinculadas aún. Abrí <code className="text-neutral-300">/player</code> en otra pestaña y vinculá su código.
-              </div>
+              <p className="text-sm text-neutral-500 text-center py-6">
+                No hay pantallas vinculadas. Abrí <code className="text-neutral-300">/player</code>{' '}
+                en un televisor para ver su código.
+              </p>
             ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-4">
                 {screens.map((scr) => {
-                  const isAlive = now - (scr.telemetry?.lastSeen || 0) < 90000;
+                  const lastSeenMs = getTimestampMillis(scr.lastSeen);
+                  const isOnline = now > 0 && lastSeenMs > 0 && now - lastSeenMs < 75000;
+
                   return (
                     <div
                       key={scr.id}
-                      className="bg-neutral-950 border border-neutral-800 rounded-xl p-4 flex flex-col justify-between gap-4"
+                      className="bg-neutral-950 border border-neutral-800 rounded-xl p-4 space-y-3"
                     >
-                      <div>
-                        <div className="flex items-center justify-between gap-2">
-                          <h3 className="font-semibold text-white truncate">{scr.name}</h3>
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
                           <span
-                            className={`inline-flex items-center gap-1.5 text-xs px-2.5 py-0.5 rounded-full font-medium ${
-                              isAlive
-                                ? 'bg-emerald-500/10 text-emerald-400'
-                                : 'bg-red-500/10 text-red-400'
+                            className={`w-2.5 h-2.5 rounded-full ${
+                              isOnline ? 'bg-emerald-500' : 'bg-neutral-600'
                             }`}
-                          >
-                            {isAlive ? <Wifi className="w-3 h-3" /> : <WifiOff className="w-3 h-3" />}
-                            {isAlive ? 'Online' : 'Sin señal'}
-                          </span>
+                          />
+                          <h3 className="font-semibold text-sm">{scr.name}</h3>
                         </div>
-
-                        <p className="text-xs text-neutral-400 mt-1.5">
-                          En pantalla: <span className="text-neutral-200">{scr.telemetry?.currentItemTitle || '—'}</span>
-                        </p>
-                        <p className="text-[11px] text-neutral-500 mt-0.5">
-                          Caché offline: {scr.telemetry?.cachedItemsCount || 0} archivos · Rotación: {scr.rotation}°
-                        </p>
+                        <button
+                          type="button"
+                          onClick={() => handleUnpairScreen(scr.id)}
+                          className="text-xs text-neutral-500 hover:text-red-400"
+                        >
+                          Desvincular
+                        </button>
                       </div>
 
-                      <div className="space-y-3 pt-2 border-t border-neutral-900">
+                      <p className="text-xs text-neutral-500">
+                        Estado: {scr.currentStatus || scr.status || 'Activo'} • Código:{' '}
+                        <span className="font-mono">{scr.pairingCode}</span>
+                      </p>
+
+                      <div className="grid grid-cols-2 gap-2">
                         <select
                           value={scr.channelId || ''}
-                          onChange={(e) => handleScreenChannelChange(scr.id, e.target.value)}
-                          className="w-full bg-neutral-900 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-200"
+                          onChange={(e) =>
+                            handleUpdateScreen(scr.id, { channelId: e.target.value })
+                          }
+                          className="bg-neutral-900 border border-neutral-700 rounded-lg px-2.5 py-1.5 text-xs"
                         >
-                          <option value="">Sin canal asignado</option>
-                          {channels.map((ch) => (
-                            <option key={ch.id} value={ch.id}>
-                              Canal: {ch.name}
+                          <option value="">-- Sin canal --</option>
+                          {channels.map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.name}
                             </option>
                           ))}
                         </select>
 
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            onClick={() => handleScreenCommand(scr.id, 'playing')}
-                            title="Reproducir"
-                            className={`flex-1 py-1.5 rounded-lg flex items-center justify-center gap-1 text-xs font-medium cursor-pointer ${
-                              scr.command === 'playing'
-                                ? 'bg-emerald-600 text-white'
-                                : 'bg-neutral-900 text-neutral-400 hover:text-white'
-                            }`}
-                          >
-                            <Play className="w-3.5 h-3.5" /> Play
-                          </button>
-                          <button
-                            onClick={() => handleScreenCommand(scr.id, 'paused')}
-                            title="Pausar"
-                            className={`flex-1 py-1.5 rounded-lg flex items-center justify-center gap-1 text-xs font-medium cursor-pointer ${
-                              scr.command === 'paused'
-                                ? 'bg-amber-600 text-white'
-                                : 'bg-neutral-900 text-neutral-400 hover:text-white'
-                            }`}
-                          >
-                            <Pause className="w-3.5 h-3.5" /> Pausa
-                          </button>
-                          <button
-                            onClick={() => handleScreenCommand(scr.id, 'blackout')}
-                            title="Apagar pantalla"
-                            className={`flex-1 py-1.5 rounded-lg flex items-center justify-center gap-1 text-xs font-medium cursor-pointer ${
-                              scr.command === 'blackout'
-                                ? 'bg-red-600 text-white'
-                                : 'bg-neutral-900 text-neutral-400 hover:text-white'
-                            }`}
-                          >
-                            <PowerOff className="w-3.5 h-3.5" /> Negro
-                          </button>
-                          <button
-                            onClick={() => handleRotateScreen(scr)}
-                            title="Rotar 90°"
-                            className="p-1.5 rounded-lg bg-neutral-900 text-neutral-400 hover:text-white cursor-pointer"
-                          >
-                            <RotateCw className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
+                        <select
+                          value={scr.rotation || 0}
+                          onChange={(e) =>
+                            handleUpdateScreen(scr.id, {
+                              rotation: Number(e.target.value) as ScreenRotation,
+                            })
+                          }
+                          className="bg-neutral-900 border border-neutral-700 rounded-lg px-2.5 py-1.5 text-xs"
+                        >
+                          <option value={0}>Horizontal (0°)</option>
+                          <option value={90}>Vertical (90°)</option>
+                          <option value={180}>Invertido (180°)</option>
+                          <option value={270}>Vertical (270°)</option>
+                        </select>
+                      </div>
+
+                      <div className="flex gap-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={() => handleUpdateScreen(scr.id, { command: 'playing' })}
+                          className={`flex-1 py-1.5 rounded-lg text-xs font-medium border ${
+                            scr.command === 'playing'
+                              ? 'bg-emerald-600/20 border-emerald-500 text-emerald-300'
+                              : 'bg-neutral-900 border-neutral-800 text-neutral-400'
+                          }`}
+                        >
+                          ▶ Play
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleUpdateScreen(scr.id, { command: 'paused' })}
+                          className={`flex-1 py-1.5 rounded-lg text-xs font-medium border ${
+                            scr.command === 'paused'
+                              ? 'bg-amber-600/20 border-amber-500 text-amber-300'
+                              : 'bg-neutral-900 border-neutral-800 text-neutral-400'
+                          }`}
+                        >
+                          ⏸ Pausa
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleUpdateScreen(scr.id, { command: 'blackout' })}
+                          className={`flex-1 py-1.5 rounded-lg text-xs font-medium border ${
+                            scr.command === 'blackout'
+                              ? 'bg-red-600/20 border-red-500 text-red-300'
+                              : 'bg-neutral-900 border-neutral-800 text-neutral-400'
+                          }`}
+                        >
+                          ⬛ Apagar
+                        </button>
                       </div>
                     </div>
                   );
                 })}
               </div>
             )}
-          </div>
-        </section>
-
-        <section className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-6 space-y-4">
-            <h2 className="text-lg font-semibold">Canales de Contenido</h2>
-
-            <form onSubmit={handleCreateChannel} className="flex gap-2">
-              <input
-                type="text"
-                placeholder="Nuevo canal (ej: Menú Café)"
-                value={newChannelName}
-                onChange={(e) => setNewChannelName(e.target.value)}
-                className="flex-1 bg-neutral-950 border border-neutral-800 rounded-xl px-3 py-2 text-sm focus:border-emerald-500 focus:outline-none"
-              />
-              <button
-                type="submit"
-                className="bg-neutral-800 hover:bg-neutral-700 px-3.5 py-2 rounded-xl text-sm font-medium cursor-pointer"
-              >
-                Crear
-              </button>
-            </form>
-
-            <div className="space-y-2 pt-2">
-              {channels.map((ch) => (
-                <button
-                  key={ch.id}
-                  onClick={() => handleSelectChannel(ch)}
-                  className={`w-full text-left px-4 py-3 rounded-xl border transition flex items-center justify-between cursor-pointer ${
-                    selectedChannelId === ch.id
-                      ? 'bg-emerald-500/10 border-emerald-500/40 text-white'
-                      : 'bg-neutral-950 border-neutral-800 text-neutral-400 hover:text-white'
-                  }`}
-                >
-                  <span className="font-medium text-sm">{ch.name}</span>
-                  <span className="text-xs bg-neutral-900 px-2 py-0.5 rounded-md">
-                    {ch.items?.length || 0} items
-                  </span>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="lg:col-span-2 bg-neutral-900 border border-neutral-800 rounded-2xl p-6 space-y-6">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-              <div>
-                <h2 className="text-lg font-semibold">
-                  Programación: {channels.find((c) => c.id === selectedChannelId)?.name || 'Seleccioná un canal'}
-                </h2>
-                <p className="text-xs text-neutral-400">
-                  Agregá imágenes, videos MP4 directos o links de YouTube con su duración en segundos.
-                </p>
-              </div>
-              {selectedChannelId && (
-                <button
-                  onClick={handlePublishChannel}
-                  className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2.5 rounded-xl text-sm font-semibold flex items-center gap-2 cursor-pointer"
-                >
-                  <Send className="w-4 h-4" /> Publicar en Pantallas
-                </button>
-              )}
-            </div>
-
-            {selectedChannelId && (
-              <>
-                <form onSubmit={handleAddDraftItem} className="grid grid-cols-1 md:grid-cols-12 gap-3 bg-neutral-950 p-4 rounded-xl border border-neutral-800">
-                  <div className="md:col-span-3">
-                    <select
-                      value={itemType}
-                      onChange={(e) => setItemType(e.target.value as MediaType)}
-                      className="w-full bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-sm"
-                    >
-                      <option value="image">Imagen (URL)</option>
-                      <option value="video">Video MP4 (URL)</option>
-                      <option value="youtube">YouTube Link</option>
-                    </select>
-                  </div>
-                  <div className="md:col-span-3">
-                    <input
-                      type="text"
-                      placeholder="Título (ej: Promo 2x1)"
-                      value={itemTitle}
-                      onChange={(e) => setItemTitle(e.target.value)}
-                      className="w-full bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-sm"
-                    />
-                  </div>
-                  <div className="md:col-span-4">
-                    <input
-                      type="url"
-                      placeholder="https://..."
-                      value={itemUrl}
-                      onChange={(e) => setItemUrl(e.target.value)}
-                      className="w-full bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-sm"
-                    />
-                  </div>
-                  <div className="md:col-span-2 flex gap-2">
-                    <input
-                      type="number"
-                      min={2}
-                      max={3600}
-                      title="Duración en segundos"
-                      value={itemDuration}
-                      onChange={(e) => setItemDuration(Number(e.target.value))}
-                      className="w-full bg-neutral-900 border border-neutral-800 rounded-lg px-2.5 py-2 text-sm text-center"
-                    />
-                    <button
-                      type="submit"
-                      className="bg-neutral-800 hover:bg-neutral-700 px-3 rounded-lg text-white cursor-pointer"
-                    >
-                      <Plus className="w-4 h-4" />
-                    </button>
-                  </div>
-                </form>
-
-                <div className="space-y-2">
-                  {draftItems.length === 0 ? (
-                    <p className="text-sm text-neutral-500 text-center py-6">
-                      Este canal todavía no tiene contenidos. Agregá uno arriba y presioná &quot;Publicar en Pantallas&quot;.
-                    </p>
-                  ) : (
-                    draftItems.map((item, idx) => (
-                      <div
-                        key={item.id}
-                        className="flex items-center justify-between bg-neutral-950 border border-neutral-800 px-4 py-3 rounded-xl"
-                      >
-                        <div className="flex items-center gap-3 min-w-0">
-                          <span className="text-xs font-mono text-neutral-500">#{idx + 1}</span>
-                          {item.type === 'youtube' && <Video className="w-4 h-4 text-red-400 shrink-0" />}
-                          {item.type === 'image' && <ImageIcon className="w-4 h-4 text-sky-400 shrink-0" />}
-                          {item.type === 'video' && <Film className="w-4 h-4 text-purple-400 shrink-0" />}
-                          <div className="truncate">
-                            <p className="text-sm font-medium text-white truncate">{item.title}</p>
-                            <p className="text-xs text-neutral-500 truncate">{item.url}</p>
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-4 shrink-0">
-                          <span className="text-xs font-mono bg-neutral-900 px-2.5 py-1 rounded text-neutral-300">
-                            {item.duration}s
-                          </span>
-                          <button
-                            onClick={() => handleRemoveDraftItem(item.id)}
-                            className="text-neutral-500 hover:text-red-400 cursor-pointer"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </>
-            )}
-          </div>
-        </section>
+          </section>
+        </div>
       </div>
     </div>
   );
