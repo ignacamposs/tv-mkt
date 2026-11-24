@@ -1,0 +1,73 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Funciones auxiliares de roles
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isAgency() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && getUserData().role == 'agency';
+    }
+
+    function isClient() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && getUserData().role == 'client';
+    }
+
+    function myClientId() {
+      return getUserData().clientId;
+    }
+
+    // Perfiles de usuario (Agencia y Comercios)
+    match /users/{userId} {
+      allow read: if isSignedIn() && (request.auth.uid == userId || isAgency());
+      allow create: if isSignedIn() && (request.auth.uid == userId || isAgency());
+      allow update, delete: if isAgency();
+    }
+
+    // Ficha de comercios (solo la agencia administra altas/bajas)
+    match /clients/{clientId} {
+      allow read: if isAgency() || (isClient() && myClientId() == clientId);
+      allow create, update, delete: if isAgency();
+    }
+
+    // Canales de reproducción
+    // 'get' abierto para que el /player del TV lea su canal asignado sin login
+    match /channels/{channelId} {
+      allow get: if true;
+      allow list: if isSignedIn();
+      allow create: if isAgency()
+        || (isClient() && request.resource.data.clientId == myClientId());
+      allow update, delete: if isAgency()
+        || (isClient() && resource.data.clientId == myClientId());
+    }
+
+    // Pantallas y Televisores
+    match /screens/{screenId} {
+      allow get: if true;
+      allow list: if isSignedIn();
+      // Permite que un TV nuevo genere su código de vinculación al abrir /player
+      allow create: if true;
+      // Agencia edita todo; Comercio edita sus TVs; TV sin login solo actualiza telemetría
+      allow update: if isAgency()
+        || (isClient() && resource.data.clientId == myClientId())
+        || (!isSignedIn() && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['telemetry', 'lastSeen', 'currentStatus', 'status', 'cachedCount']));
+      allow delete: if isAgency();
+    }
+
+    // Configuraciones internas
+    match /settings/{docId} {
+      allow read, write: if isAgency();
+    }
+  }
+}

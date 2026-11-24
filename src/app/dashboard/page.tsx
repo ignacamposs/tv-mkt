@@ -2,6 +2,12 @@
 
 import React, { useEffect, useState, useRef } from 'react';
 import {
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  signOut,
+  createUserWithEmailAndPassword,
+} from 'firebase/auth';
+import {
   collection,
   doc,
   onSnapshot,
@@ -14,11 +20,15 @@ import {
   setDoc,
   getDoc,
 } from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { Channel, MediaItem, Screen, ScreenRotation } from '../../types/signage';
-
-const DEFAULT_PIN = '123456';
-const PIN_STORAGE_KEY = 'signage_dashboard_unlocked';
+import { auth, secondaryAuth, db } from '../../lib/firebase';
+import {
+  Channel,
+  ClientAccount,
+  MediaItem,
+  Screen,
+  ScreenRotation,
+  UserProfile,
+} from '../../types/signage';
 
 type ScreenWithMeta = Screen & {
   id: string;
@@ -50,17 +60,26 @@ function getTimestampMillis(value: unknown): number {
 }
 
 export default function DashboardPage() {
-  // Autenticación por PIN
-  const [isUnlocked, setIsUnlocked] = useState<boolean>(false);
-  const [pinInput, setPinInput] = useState<string>('');
-  const [activePin, setActivePin] = useState<string>(DEFAULT_PIN);
-  const [newPin, setNewPin] = useState<string>('');
-  const [showPinEditor, setShowPinEditor] = useState<boolean>(false);
+  // Sesión y Rol (Agencia vs Comercio)
+  const [authLoading, setAuthLoading] = useState<boolean>(true);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [loginEmail, setLoginEmail] = useState<string>('');
+  const [loginPassword, setLoginPassword] = useState<string>('');
+  const [isLoggingIn, setIsLoggingIn] = useState<boolean>(false);
+
+  // Gestión de Comercios (Solo Agencia)
+  const [clients, setClients] = useState<ClientAccount[]>([]);
+  const [clientFilterId, setClientFilterId] = useState<string>('all');
+  const [newClientName, setNewClientName] = useState<string>('');
+  const [newClientEmail, setNewClientEmail] = useState<string>('');
+  const [newClientPassword, setNewClientPassword] = useState<string>('');
+  const [isCreatingClient, setIsCreatingClient] = useState<boolean>(false);
 
   // Canales y programación
   const [channels, setChannels] = useState<Channel[]>([]);
   const [selectedChannelId, setSelectedChannelId] = useState<string>('');
   const [newChannelName, setNewChannelName] = useState<string>('');
+  const [newChannelClientId, setNewChannelClientId] = useState<string>('');
   const [draftItems, setDraftItems] = useState<MediaItem[]>([]);
   const [hasChanges, setHasChanges] = useState<boolean>(false);
   const [isPublishing, setIsPublishing] = useState<boolean>(false);
@@ -85,6 +104,7 @@ export default function DashboardPage() {
   const [screens, setScreens] = useState<ScreenWithMeta[]>([]);
   const [pairingCode, setPairingCode] = useState<string>('');
   const [newScreenName, setNewScreenName] = useState<string>('');
+  const [newScreenClientId, setNewScreenClientId] = useState<string>('');
   const [isPairing, setIsPairing] = useState<boolean>(false);
 
   // Feedback y reloj seguro para Next.js 16
@@ -93,7 +113,7 @@ export default function DashboardPage() {
 
   const showToast = (type: 'ok' | 'err', text: string) => {
     setFeedbackMsg({ type, text });
-    setTimeout(() => setFeedbackMsg(null), 4000);
+    setTimeout(() => setFeedbackMsg(null), 4500);
   };
 
   useEffect(() => {
@@ -102,29 +122,74 @@ export default function DashboardPage() {
     return () => clearInterval(timer);
   }, []);
 
-  // Cargar configuración de PIN
+  // Escuchar sesión de Firebase Auth y resolver perfil
   useEffect(() => {
-    const savedSession = sessionStorage.getItem(PIN_STORAGE_KEY);
-    if (savedSession === 'true') {
-      setIsUnlocked(true);
-    }
+    const unsub = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (!firebaseUser) {
+        setProfile(null);
+        setAuthLoading(false);
+        return;
+      }
 
-    getDoc(doc(db, 'settings', 'security'))
-      .then((snap) => {
-        if (snap.exists() && snap.data()?.pin) {
-          setActivePin(String(snap.data().pin));
+      try {
+        const userRef = doc(db, 'users', firebaseUser.uid);
+        const snap = await getDoc(userRef);
+
+        if (snap.exists()) {
+          setProfile(snap.data() as UserProfile);
+        } else {
+          // Primer ingreso del administrador creado en Firebase Console -> se registra como Agencia
+          const agencyProfile: UserProfile = {
+            uid: firebaseUser.uid,
+            email: firebaseUser.email || '',
+            role: 'agency',
+            name: 'Agencia Principal',
+          };
+          await setDoc(userRef, agencyProfile);
+          setProfile(agencyProfile);
         }
-      })
-      .catch(() => {});
+      } catch {
+        showToast('err', 'Error al cargar el perfil de usuario');
+      } finally {
+        setAuthLoading(false);
+      }
+    });
+
+    return () => unsub();
   }, []);
 
-  // Suscripción en tiempo real a canales
+  // Suscripción a Comercios (Solo para Agencia)
   useEffect(() => {
+    if (!profile || profile.role !== 'agency') {
+      setClients([]);
+      return;
+    }
+
+    const unsub = onSnapshot(collection(db, 'clients'), (snapshot) => {
+      const list: ClientAccount[] = snapshot.docs.map((d) => ({
+        ...(d.data() as ClientAccount),
+        id: d.id,
+      }));
+      setClients(list);
+    });
+
+    return () => unsub();
+  }, [profile]);
+
+  // Suscripción en tiempo real a canales (filtrados según rol)
+  useEffect(() => {
+    if (!profile) return;
+
     const unsub = onSnapshot(collection(db, 'channels'), (snapshot) => {
-      const list: Channel[] = snapshot.docs.map((d) => ({
+      let list: Channel[] = snapshot.docs.map((d) => ({
         ...(d.data() as Channel),
         id: d.id,
       }));
+
+      if (profile.role === 'client') {
+        list = list.filter((c) => c.clientId === profile.clientId);
+      }
+
       setChannels(list);
 
       if (list.length > 0) {
@@ -132,11 +197,13 @@ export default function DashboardPage() {
           if (prev && list.some((c) => c.id === prev)) return prev;
           return list[0].id;
         });
+      } else {
+        setSelectedChannelId('');
       }
     });
 
     return () => unsub();
-  }, []);
+  }, [profile]);
 
   // Sincronizar items del canal seleccionado cuando no hay ediciones pendientes
   useEffect(() => {
@@ -151,20 +218,27 @@ export default function DashboardPage() {
     }
   }, [selectedChannelId, channels, hasChanges]);
 
-  // Suscripción en tiempo real a pantallas
+  // Suscripción en tiempo real a pantallas (filtradas según rol)
   useEffect(() => {
+    if (!profile) return;
+
     const unsub = onSnapshot(collection(db, 'screens'), (snapshot) => {
-      const list: ScreenWithMeta[] = snapshot.docs
+      let list: ScreenWithMeta[] = snapshot.docs
         .map((d) => ({
           ...(d.data() as Screen),
           id: d.id,
         }))
         .filter((s) => s.isPaired);
+
+      if (profile.role === 'client') {
+        list = list.filter((s) => s.clientId === profile.clientId);
+      }
+
       setScreens(list);
     });
 
     return () => unsub();
-  }, []);
+  }, [profile]);
 
   // Lógica del Loop y barra de progreso en Vista Previa
   const safePreviewIndex = draftItems.length > 0 ? previewIndex % draftItems.length : 0;
@@ -217,41 +291,100 @@ export default function DashboardPage() {
     lastPreviewItemRef.current = activePreviewItem;
   }, [activePreviewItem]);
 
-  const handleUnlock = (e: React.FormEvent) => {
+  // Handlers de Autenticación
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (pinInput.trim() === activePin || pinInput.trim() === DEFAULT_PIN) {
-      setIsUnlocked(true);
-      sessionStorage.setItem(PIN_STORAGE_KEY, 'true');
-      setPinInput('');
-    } else {
-      showToast('err', 'PIN incorrecto');
+    if (!loginEmail.trim() || !loginPassword.trim()) return;
+    setIsLoggingIn(true);
+    try {
+      await signInWithEmailAndPassword(auth, loginEmail.trim(), loginPassword);
+      setLoginPassword('');
+    } catch {
+      showToast('err', 'Correo o contraseña incorrectos');
+    } finally {
+      setIsLoggingIn(false);
     }
   };
 
-  const handleSaveNewPin = async (e: React.FormEvent) => {
+  const handleLogout = async () => {
+    await signOut(auth);
+    setHasChanges(false);
+    setSelectedChannelId('');
+  };
+
+  // Crear subcuenta de Comercio (Solo Agencia)
+  const handleCreateClientAccount = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (newPin.trim().length < 4) {
-      showToast('err', 'El PIN debe tener al menos 4 dígitos');
+    if (profile?.role !== 'agency') return;
+    if (!newClientName.trim() || !newClientEmail.trim() || newClientPassword.length < 6) {
+      showToast('err', 'Completá nombre, correo y una clave de al menos 6 caracteres');
       return;
     }
+
+    setIsCreatingClient(true);
     try {
-      await setDoc(doc(db, 'settings', 'security'), { pin: newPin.trim() }, { merge: true });
-      setActivePin(newPin.trim());
-      setNewPin('');
-      setShowPinEditor(false);
-      showToast('ok', 'PIN actualizado correctamente');
-    } catch {
-      showToast('err', 'No se pudo guardar el PIN');
+      const cred = await createUserWithEmailAndPassword(
+        secondaryAuth,
+        newClientEmail.trim(),
+        newClientPassword
+      );
+      const clientUid = cred.user.uid;
+      await signOut(secondaryAuth);
+
+      // 1. Crear ficha del comercio
+      const clientDoc = await addDoc(collection(db, 'clients'), {
+        name: newClientName.trim(),
+        email: newClientEmail.trim(),
+        ownerUid: clientUid,
+        active: true,
+        createdAt: Date.now(),
+      });
+
+      // 2. Guardar perfil con rol 'client'
+      const clientUserProfile: UserProfile = {
+        uid: clientUid,
+        email: newClientEmail.trim(),
+        role: 'client',
+        clientId: clientDoc.id,
+        name: newClientName.trim(),
+      };
+      await setDoc(doc(db, 'users', clientUid), clientUserProfile);
+
+      // 3. Crear canal inicial exclusivo para ese comercio
+      await addDoc(collection(db, 'channels'), {
+        name: `Programación - ${newClientName.trim()}`,
+        items: [],
+        clientId: clientDoc.id,
+      });
+
+      setNewClientName('');
+      setNewClientEmail('');
+      setNewClientPassword('');
+      showToast('ok', 'Comercio creado con su acceso y canal propios');
+    } catch (err: unknown) {
+      const msg =
+        err instanceof Error && err.message.includes('email-already-in-use')
+          ? 'Ese correo ya está registrado en el sistema'
+          : 'Error al crear la cuenta del comercio';
+      showToast('err', msg);
+    } finally {
+      setIsCreatingClient(false);
     }
   };
 
+  // Canales
   const handleCreateChannel = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newChannelName.trim()) return;
+    if (!newChannelName.trim() || !profile) return;
+
+    const assignedClientId =
+      profile.role === 'client' ? profile.clientId || '' : newChannelClientId;
+
     try {
       const docRef = await addDoc(collection(db, 'channels'), {
         name: newChannelName.trim(),
         items: [],
+        ...(assignedClientId ? { clientId: assignedClientId } : {}),
       });
       setNewChannelName('');
       setSelectedChannelId(docRef.id);
@@ -264,6 +397,15 @@ export default function DashboardPage() {
   };
 
   const handleDeleteChannel = async (channelId: string) => {
+    const target = channels.find((c) => c.id === channelId);
+    if (
+      profile?.role === 'client' &&
+      target?.items?.some((item) => item.createdBy === 'agency')
+    ) {
+      showToast('err', 'No podés eliminar un canal que tiene pautas activas de la agencia');
+      return;
+    }
+
     try {
       await deleteDoc(doc(db, 'channels', channelId));
       if (selectedChannelId === channelId) {
@@ -277,6 +419,7 @@ export default function DashboardPage() {
     }
   };
 
+  // Subida a Cloudinary
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -322,6 +465,7 @@ export default function DashboardPage() {
 
   const handleAddItem = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!profile) return;
     if (!selectedChannelId) {
       showToast('err', 'Creá o seleccioná un canal primero');
       return;
@@ -356,6 +500,7 @@ export default function DashboardPage() {
       ...(ytId ? { youtubeId: ytId } : {}),
       duration: Math.max(Number(itemDuration) || 10, 2),
       order: draftItems.length,
+      createdBy: profile.role,
     };
 
     setDraftItems((prev) => [...prev, newItem]);
@@ -365,9 +510,14 @@ export default function DashboardPage() {
     setItemDuration(10);
   };
 
-  const handleRemoveItem = (id: string) => {
+  const handleRemoveItem = (item: MediaItem) => {
+    if (profile?.role === 'client' && item.createdBy === 'agency') {
+      showToast('err', 'Este espacio está bloqueado por la agencia');
+      return;
+    }
+
     setDraftItems((prev) =>
-      prev.filter((item) => item.id !== id).map((item, idx) => ({ ...item, order: idx }))
+      prev.filter((i) => i.id !== item.id).map((i, idx) => ({ ...i, order: idx }))
     );
     setHasChanges(true);
   };
@@ -375,12 +525,61 @@ export default function DashboardPage() {
   const handleMoveItem = (index: number, direction: -1 | 1) => {
     const target = index + direction;
     if (target < 0 || target >= draftItems.length) return;
+
+    const currentItem = draftItems[index];
+    const targetItem = draftItems[target];
+
+    // El comercio no puede mover spots de la agencia ni desplazarlos
+    if (
+      profile?.role === 'client' &&
+      (currentItem.createdBy === 'agency' || targetItem.createdBy === 'agency')
+    ) {
+      showToast('err', 'Los espacios de la agencia tienen posición fija');
+      return;
+    }
+
     const updated = [...draftItems];
-    const temp = updated[index];
-    updated[index] = updated[target];
-    updated[target] = temp;
+    updated[index] = targetItem;
+    updated[target] = currentItem;
     setDraftItems(updated.map((item, idx) => ({ ...item, order: idx })));
     setHasChanges(true);
+  };
+
+  // Replicar un spot bloqueado de Agencia en todos los canales de comercios
+  const handleReplicateAgencyAdToAllClients = async (adItem: MediaItem) => {
+    if (profile?.role !== 'agency') return;
+    const clientChannels = channels.filter((c) => Boolean(c.clientId));
+
+    if (clientChannels.length === 0) {
+      showToast('err', 'Todavía no hay canales de comercios creados');
+      return;
+    }
+
+    try {
+      const lockedAd: MediaItem = {
+        ...adItem,
+        createdBy: 'agency',
+      };
+
+      await Promise.all(
+        clientChannels.map((ch) => {
+          const existing = ch.items || [];
+          const filtered = existing.filter((i) => i.id !== lockedAd.id);
+          const merged = [lockedAd, ...filtered].map((item, idx) => ({
+            ...item,
+            order: idx,
+          }));
+          return updateDoc(doc(db, 'channels', ch.id), { items: merged });
+        })
+      );
+
+      showToast(
+        'ok',
+        `Pauta inyectada en ${clientChannels.length} canal(es) de comercios automáticamente`
+      );
+    } catch {
+      showToast('err', 'Error al replicar la pauta en los comercios');
+    }
   };
 
   const handlePublish = async () => {
@@ -400,10 +599,15 @@ export default function DashboardPage() {
     }
   };
 
+  // Pantallas
   const handlePairScreen = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!profile) return;
     const code = pairingCode.trim().toUpperCase();
     if (!code) return;
+
+    const assignedClientId =
+      profile.role === 'client' ? profile.clientId || '' : newScreenClientId;
 
     setIsPairing(true);
     try {
@@ -416,10 +620,15 @@ export default function DashboardPage() {
       }
 
       const targetDoc = snap.docs[0];
+      const defaultChannelForClient = assignedClientId
+        ? channels.find((c) => c.clientId === assignedClientId)?.id || selectedChannelId
+        : selectedChannelId;
+
       await updateDoc(doc(db, 'screens', targetDoc.id), {
         isPaired: true,
         name: newScreenName.trim() || `Pantalla ${code}`,
-        channelId: selectedChannelId || '',
+        channelId: defaultChannelForClient || '',
+        ...(assignedClientId ? { clientId: assignedClientId } : { clientId: '' }),
         command: 'playing',
         rotation: 0,
       });
@@ -454,38 +663,89 @@ export default function DashboardPage() {
     }
   };
 
-  if (!isUnlocked) {
+  // Pantalla de carga inicial de sesión
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-neutral-950 text-neutral-400 flex items-center justify-center">
+        Verificando credenciales...
+      </div>
+    );
+  }
+
+  // Pantalla de Login (Agencia y Comercios)
+  if (!profile) {
     return (
       <div className="min-h-screen bg-neutral-950 text-white flex items-center justify-center p-6">
         <form
-          onSubmit={handleUnlock}
-          className="w-full max-w-sm bg-neutral-900 border border-neutral-800 rounded-2xl p-8 shadow-2xl"
+          onSubmit={handleLogin}
+          className="w-full max-w-sm bg-neutral-900 border border-neutral-800 rounded-2xl p-8 shadow-2xl space-y-4"
         >
-          <h1 className="text-2xl font-bold mb-2">Panel de Control</h1>
-          <p className="text-sm text-neutral-400 mb-6">
-            Ingresá el PIN de administrador para gestionar pantallas y canales.
-          </p>
-          <input
-            type="password"
-            value={pinInput}
-            onChange={(e) => setPinInput(e.target.value)}
-            placeholder="PIN (ej. 123456)"
-            className="w-full bg-neutral-950 border border-neutral-700 rounded-xl px-4 py-3 text-center text-xl tracking-widest mb-4 focus:outline-none focus:border-emerald-500"
-            autoFocus
-          />
+          <div>
+            <span className="inline-block px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium mb-2">
+              Acceso Plataforma
+            </span>
+            <h1 className="text-2xl font-bold">Iniciar Sesión</h1>
+            <p className="text-sm text-neutral-400 mt-1">
+              Ingresá con tu cuenta de Agencia o Comercio para gestionar tus pantallas.
+            </p>
+          </div>
+
+          <div className="space-y-3 pt-2">
+            <input
+              type="email"
+              required
+              value={loginEmail}
+              onChange={(e) => setLoginEmail(e.target.value)}
+              placeholder="Correo electrónico"
+              className="w-full bg-neutral-950 border border-neutral-700 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-emerald-500"
+              autoFocus
+            />
+            <input
+              type="password"
+              required
+              value={loginPassword}
+              onChange={(e) => setLoginPassword(e.target.value)}
+              placeholder="Contraseña"
+              className="w-full bg-neutral-950 border border-neutral-700 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-emerald-500"
+            />
+          </div>
+
           <button
             type="submit"
+            disabled={isLoggingIn}
             className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-3 rounded-xl transition"
           >
-            Ingresar
+            {isLoggingIn ? 'Ingresando...' : 'Entrar al Panel'}
           </button>
+
           {feedbackMsg && (
-            <p className="mt-4 text-center text-sm text-red-400">{feedbackMsg.text}</p>
+            <p className="text-center text-sm text-red-400">{feedbackMsg.text}</p>
           )}
         </form>
       </div>
     );
   }
+
+  const isAgency = profile.role === 'agency';
+  const clientNameMap: Record<string, string> = {};
+  clients.forEach((c) => {
+    clientNameMap[c.id] = c.name;
+  });
+
+  // Filtros visuales para Agencia
+  const visibleChannels =
+    isAgency && clientFilterId !== 'all'
+      ? channels.filter((c) =>
+          clientFilterId === 'agency_only' ? !c.clientId : c.clientId === clientFilterId
+        )
+      : channels;
+
+  const visibleScreens =
+    isAgency && clientFilterId !== 'all'
+      ? screens.filter((s) =>
+          clientFilterId === 'agency_only' ? !s.clientId : s.clientId === clientFilterId
+        )
+      : screens;
 
   const progressPercent = Math.min(
     100,
@@ -500,15 +760,26 @@ export default function DashboardPage() {
     <div className="min-h-screen bg-neutral-950 text-white p-6 md:p-10">
       <div className="max-w-7xl mx-auto space-y-8">
         {/* Header */}
-        <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-neutral-800 pb-6">
+        <header className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-neutral-800 pb-6">
           <div>
-            <h1 className="text-2xl font-bold tracking-tight">Gestión de Cartelería Digital</h1>
-            <p className="text-sm text-neutral-400">
-              Control remoto de canales, previsualización en vivo y televisores en tiempo real
-            </p>
+            <div className="flex items-center gap-2.5 mb-1">
+              <span
+                className={`text-xs font-semibold px-2.5 py-0.5 rounded-full border ${
+                  isAgency
+                    ? 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30'
+                    : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                }`}
+              >
+                {isAgency ? 'MODO AGENCIA (MASTER)' : `COMERCIO: ${profile.name || 'Local'}`}
+              </span>
+              <span className="text-xs text-neutral-500">{profile.email}</span>
+            </div>
+            <h1 className="text-2xl font-bold tracking-tight">
+              {isAgency ? 'Red de Cartelería Digital' : 'Mi Panel de Pantallas'}
+            </h1>
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <a
               href="/player"
               target="_blank"
@@ -518,37 +789,12 @@ export default function DashboardPage() {
               Simular TV (/player) ↗
             </a>
 
-            {showPinEditor ? (
-              <form onSubmit={handleSaveNewPin} className="flex items-center gap-2">
-                <input
-                  type="text"
-                  value={newPin}
-                  onChange={(e) => setNewPin(e.target.value)}
-                  placeholder="Nuevo PIN"
-                  className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-1.5 text-sm w-28"
-                />
-                <button
-                  type="submit"
-                  className="bg-emerald-600 hover:bg-emerald-500 px-3 py-1.5 rounded-lg text-sm font-medium"
-                >
-                  Guardar
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setShowPinEditor(false)}
-                  className="text-neutral-400 hover:text-white text-sm px-2"
-                >
-                  Cancelar
-                </button>
-              </form>
-            ) : (
-              <button
-                onClick={() => setShowPinEditor(true)}
-                className="bg-neutral-900 hover:bg-neutral-800 border border-neutral-700 px-4 py-2 rounded-xl text-sm font-medium transition"
-              >
-                Cambiar PIN
-              </button>
-            )}
+            <button
+              onClick={handleLogout}
+              className="bg-neutral-900 hover:bg-red-950/40 border border-neutral-700 hover:border-red-800 px-4 py-2 rounded-xl text-sm font-medium text-neutral-300 hover:text-red-300 transition"
+            >
+              Cerrar Sesión
+            </button>
           </div>
         </header>
 
@@ -564,13 +810,107 @@ export default function DashboardPage() {
           </div>
         )}
 
+        {/* SECCIÓN EXCLUSIVA AGENCIA: Gestión de Comercios (Subcuentas) */}
+        {isAgency && (
+          <section className="bg-neutral-900 border border-neutral-800 rounded-2xl p-6 space-y-5">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+              <div>
+                <h2 className="text-lg font-semibold">Comercios y Subcuentas ({clients.length})</h2>
+                <p className="text-xs text-neutral-400">
+                  Creá accesos individuales para cada local y filtrá sus pantallas o canales.
+                </p>
+              </div>
+
+              {/* Filtro rápido por comercio */}
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-neutral-400">Filtrar vista:</span>
+                <select
+                  value={clientFilterId}
+                  onChange={(e) => setClientFilterId(e.target.value)}
+                  className="bg-neutral-950 border border-neutral-700 rounded-xl px-3 py-2 text-sm"
+                >
+                  <option value="all">Todos los comercios y canales</option>
+                  <option value="agency_only">Solo propios de Agencia</option>
+                  {clients.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      Comercio: {c.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {/* Formulario alta de nuevo comercio */}
+            <form
+              onSubmit={handleCreateClientAccount}
+              className="grid grid-cols-1 sm:grid-cols-4 gap-3 bg-neutral-950 border border-neutral-800 rounded-xl p-4"
+            >
+              <input
+                type="text"
+                value={newClientName}
+                onChange={(e) => setNewClientName(e.target.value)}
+                placeholder="Nombre comercio (ej. Gym Norte)"
+                className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm"
+              />
+              <input
+                type="email"
+                value={newClientEmail}
+                onChange={(e) => setNewClientEmail(e.target.value)}
+                placeholder="Email de acceso del local"
+                className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm"
+              />
+              <input
+                type="text"
+                value={newClientPassword}
+                onChange={(e) => setNewClientPassword(e.target.value)}
+                placeholder="Contraseña (mín. 6)"
+                className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm"
+              />
+              <button
+                type="submit"
+                disabled={isCreatingClient}
+                className="bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-2 px-4 rounded-lg text-sm transition"
+              >
+                {isCreatingClient ? 'Creando...' : '+ Crear Comercio'}
+              </button>
+            </form>
+
+            {clients.length > 0 && (
+              <div className="flex flex-wrap gap-2">
+                {clients.map((c) => {
+                  const screenCount = screens.filter((s) => s.clientId === c.id).length;
+                  return (
+                    <button
+                      key={c.id}
+                      type="button"
+                      onClick={() =>
+                        setClientFilterId((prev) => (prev === c.id ? 'all' : c.id))
+                      }
+                      className={`text-left px-3.5 py-2 rounded-xl border text-xs transition ${
+                        clientFilterId === c.id
+                          ? 'bg-indigo-600/20 border-indigo-500 text-indigo-200'
+                          : 'bg-neutral-950 border-neutral-800 text-neutral-300 hover:border-neutral-700'
+                      }`}
+                    >
+                      <div className="font-semibold">{c.name}</div>
+                      <div className="text-neutral-500">
+                        {c.email} • {screenCount} TV(s)
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        )}
+
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
           {/* Columna Izquierda: Canales, Vista Previa y Playlist */}
           <section className="lg:col-span-7 bg-neutral-900 border border-neutral-800 rounded-2xl p-6 space-y-6">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <h2 className="text-lg font-semibold">Canales y Programación</h2>
 
-              <form onSubmit={handleCreateChannel} className="flex gap-2">
+              <form onSubmit={handleCreateChannel} className="flex flex-wrap gap-2">
                 <input
                   type="text"
                   value={newChannelName}
@@ -578,6 +918,20 @@ export default function DashboardPage() {
                   placeholder="Nuevo canal (ej. Promos)"
                   className="bg-neutral-950 border border-neutral-700 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-emerald-500"
                 />
+                {isAgency && (
+                  <select
+                    value={newChannelClientId}
+                    onChange={(e) => setNewChannelClientId(e.target.value)}
+                    className="bg-neutral-950 border border-neutral-700 rounded-xl px-3 py-2 text-sm"
+                  >
+                    <option value="">Canal General Agencia</option>
+                    {clients.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        Para: {c.name}
+                      </option>
+                    ))}
+                  </select>
+                )}
                 <button
                   type="submit"
                   className="bg-neutral-800 hover:bg-neutral-700 px-4 py-2 rounded-xl text-sm font-medium transition"
@@ -588,42 +942,51 @@ export default function DashboardPage() {
             </div>
 
             {/* Selector de canal activo */}
-            {channels.length > 0 ? (
+            {visibleChannels.length > 0 ? (
               <div className="flex flex-wrap items-center gap-2">
-                {channels.map((ch) => (
-                  <div
-                    key={ch.id}
-                    className={`flex items-center rounded-xl border text-sm transition ${
-                      selectedChannelId === ch.id
-                        ? 'bg-emerald-600/20 border-emerald-500 text-emerald-300'
-                        : 'bg-neutral-950 border-neutral-800 text-neutral-300 hover:border-neutral-700'
-                    }`}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setHasChanges(false);
-                        setSelectedChannelId(ch.id);
-                        setPreviewIndex(0);
-                      }}
-                      className="px-4 py-2 font-medium"
+                {visibleChannels.map((ch) => {
+                  const ownerLabel =
+                    isAgency && ch.clientId ? clientNameMap[ch.clientId] : null;
+                  return (
+                    <div
+                      key={ch.id}
+                      className={`flex items-center rounded-xl border text-sm transition ${
+                        selectedChannelId === ch.id
+                          ? 'bg-emerald-600/20 border-emerald-500 text-emerald-300'
+                          : 'bg-neutral-950 border-neutral-800 text-neutral-300 hover:border-neutral-700'
+                      }`}
                     >
-                      {ch.name}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleDeleteChannel(ch.id)}
-                      title="Eliminar canal"
-                      className="pr-3 pl-1 py-2 text-neutral-500 hover:text-red-400"
-                    >
-                      ×
-                    </button>
-                  </div>
-                ))}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setHasChanges(false);
+                          setSelectedChannelId(ch.id);
+                          setPreviewIndex(0);
+                        }}
+                        className="px-4 py-2 font-medium flex items-center gap-2"
+                      >
+                        <span>{ch.name}</span>
+                        {ownerLabel && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400">
+                            {ownerLabel}
+                          </span>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteChannel(ch.id)}
+                        title="Eliminar canal"
+                        className="pr-3 pl-1 py-2 text-neutral-500 hover:text-red-400"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  );
+                })}
               </div>
             ) : (
               <p className="text-sm text-neutral-500">
-                Creá tu primer canal para empezar a cargar imágenes o videos.
+                No hay canales en esta vista. Creá uno para comenzar a cargar anuncios.
               </p>
             )}
 
@@ -679,7 +1042,7 @@ export default function DashboardPage() {
                     className={`relative bg-black border-2 border-neutral-800 rounded-lg overflow-hidden shadow-2xl flex items-center justify-center transition-all duration-300 ${
                       previewAspect === '16:9'
                         ? 'w-full aspect-video'
-                        : 'w-52 sm:w-60 aspect-[9/16]'
+                        : 'w-52 sm:w-60 aspect-9/16'
                     }`}
                   >
                     {!activePreviewItem ? (
@@ -688,7 +1051,6 @@ export default function DashboardPage() {
                       </div>
                     ) : (
                       <>
-                        {/* Capa entrante (siempre activa debajo) */}
                         <div className="absolute inset-0 flex items-center justify-center">
                           {activePreviewItem.type === 'image' && (
                             <img
@@ -723,7 +1085,6 @@ export default function DashboardPage() {
                             )}
                         </div>
 
-                        {/* Capa saliente (fundido suave de 0.5s al cambiar de spot) */}
                         {outgoingPreviewItem && (
                           <div
                             className={`absolute inset-0 bg-black flex items-center justify-center pointer-events-none transition-opacity duration-500 ${
@@ -752,7 +1113,7 @@ export default function DashboardPage() {
                   </div>
                 </div>
 
-                {/* Barra de progreso y controles de simulación */}
+                {/* Barra de progreso y controles */}
                 {activePreviewItem && (
                   <div className="space-y-2">
                     <div className="w-full h-1.5 bg-neutral-800 rounded-full overflow-hidden">
@@ -799,7 +1160,9 @@ export default function DashboardPage() {
               >
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-sm font-medium text-neutral-300">
-                    Agregar contenido al canal
+                    {isAgency
+                      ? 'Agregar pauta de Agencia (se bloqueará para el comercio)'
+                      : 'Agregar contenido propio'}
                   </span>
                   <label className="cursor-pointer bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-3.5 py-2 rounded-lg transition">
                     {isUploading ? 'Subiendo...' : 'Elegir Archivo (Imagen / MP4)'}
@@ -893,6 +1256,9 @@ export default function DashboardPage() {
                   <ul className="space-y-2">
                     {draftItems.map((item, idx) => {
                       const isCurrentInPreview = activePreviewItem?.id === item.id;
+                      const isAgencySlot = item.createdBy === 'agency';
+                      const lockedForUser = !isAgency && isAgencySlot;
+
                       return (
                         <li
                           key={item.id}
@@ -900,6 +1266,8 @@ export default function DashboardPage() {
                           className={`cursor-pointer flex items-center justify-between gap-3 bg-neutral-950 border rounded-xl p-3 transition ${
                             isCurrentInPreview
                               ? 'border-emerald-500/60 bg-emerald-950/10'
+                              : isAgencySlot
+                              ? 'border-indigo-500/30'
                               : 'border-neutral-800 hover:border-neutral-700'
                           }`}
                         >
@@ -908,6 +1276,11 @@ export default function DashboardPage() {
                               <span className="text-xs font-mono uppercase px-2 py-0.5 rounded bg-neutral-800 text-neutral-300">
                                 {item.type}
                               </span>
+                              {isAgencySlot && (
+                                <span className="text-[11px] font-medium px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
+                                  🔒 Pauta Agencia
+                                </span>
+                              )}
                               <p className="font-medium text-sm truncate">{item.title}</p>
                             </div>
                             <p className="text-xs text-neutral-500 truncate mt-1">
@@ -919,32 +1292,54 @@ export default function DashboardPage() {
                             className="flex items-center gap-1"
                             onClick={(e) => e.stopPropagation()}
                           >
-                            <button
-                              type="button"
-                              onClick={() => handleMoveItem(idx, -1)}
-                              disabled={idx === 0}
-                              className="p-1.5 text-neutral-400 hover:text-white disabled:opacity-30"
-                              title="Subir"
-                            >
-                              ↑
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleMoveItem(idx, 1)}
-                              disabled={idx === draftItems.length - 1}
-                              className="p-1.5 text-neutral-400 hover:text-white disabled:opacity-30"
-                              title="Bajar"
-                            >
-                              ↓
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleRemoveItem(item.id)}
-                              className="p-1.5 text-red-400 hover:text-red-300 ml-1"
-                              title="Eliminar"
-                            >
-                              🗑
-                            </button>
+                            {isAgency && isAgencySlot && (
+                              <button
+                                type="button"
+                                onClick={() => handleReplicateAgencyAdToAllClients(item)}
+                                title="Inyectar esta pauta en todos los comercios"
+                                className="px-2 py-1 mr-1 rounded bg-indigo-600/20 hover:bg-indigo-600/40 border border-indigo-500/40 text-indigo-300 text-[11px] font-medium"
+                              >
+                                📢 Todos los locales
+                              </button>
+                            )}
+
+                            {!lockedForUser ? (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => handleMoveItem(idx, -1)}
+                                  disabled={idx === 0}
+                                  className="p-1.5 text-neutral-400 hover:text-white disabled:opacity-30"
+                                  title="Subir"
+                                >
+                                  ↑
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleMoveItem(idx, 1)}
+                                  disabled={idx === draftItems.length - 1}
+                                  className="p-1.5 text-neutral-400 hover:text-white disabled:opacity-30"
+                                  title="Bajar"
+                                >
+                                  ↓
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleRemoveItem(item)}
+                                  className="p-1.5 text-red-400 hover:text-red-300 ml-1"
+                                  title="Eliminar"
+                                >
+                                  🗑
+                                </button>
+                              </>
+                            ) : (
+                              <span
+                                className="text-xs text-neutral-500 px-2"
+                                title="Espacio reservado por la agencia"
+                              >
+                                Bloqueado
+                              </span>
+                            )}
                           </div>
                         </li>
                       );
@@ -957,7 +1352,9 @@ export default function DashboardPage() {
 
           {/* Columna Derecha: Pantallas */}
           <section className="lg:col-span-5 bg-neutral-900 border border-neutral-800 rounded-2xl p-6 space-y-6">
-            <h2 className="text-lg font-semibold">Pantallas Conectadas</h2>
+            <h2 className="text-lg font-semibold">
+              {isAgency ? `Pantallas de la Red (${visibleScreens.length})` : 'Mis Televisores'}
+            </h2>
 
             <form
               onSubmit={handlePairScreen}
@@ -974,10 +1371,6 @@ export default function DashboardPage() {
                   Obtener código en /player ↗
                 </a>
               </div>
-              <p className="text-xs text-neutral-500">
-                Abrí <code className="text-neutral-300">/player</code> en el televisor (o en una
-                pestaña nueva) e ingresá el código de 6 dígitos que muestra en pantalla.
-              </p>
               <div className="grid grid-cols-2 gap-2">
                 <input
                   type="text"
@@ -995,6 +1388,22 @@ export default function DashboardPage() {
                   className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm"
                 />
               </div>
+
+              {isAgency && (
+                <select
+                  value={newScreenClientId}
+                  onChange={(e) => setNewScreenClientId(e.target.value)}
+                  className="w-full bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-xs"
+                >
+                  <option value="">Asignar a comercio: Ninguno (Agencia)</option>
+                  {clients.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      Asignar a comercio: {c.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+
               <button
                 type="submit"
                 disabled={isPairing}
@@ -1004,15 +1413,18 @@ export default function DashboardPage() {
               </button>
             </form>
 
-            {screens.length === 0 ? (
+            {visibleScreens.length === 0 ? (
               <p className="text-sm text-neutral-500 text-center py-6">
-                No hay pantallas vinculadas todavía.
+                No hay pantallas vinculadas en esta vista.
               </p>
             ) : (
               <div className="space-y-4">
-                {screens.map((scr) => {
+                {visibleScreens.map((scr) => {
                   const lastSeenMs = getTimestampMillis(scr.lastSeen);
                   const isOnline = now > 0 && lastSeenMs > 0 && now - lastSeenMs < 75000;
+                  const screenChannels = isAgency
+                    ? channels
+                    : channels.filter((c) => c.clientId === profile.clientId);
 
                   return (
                     <div
@@ -1028,19 +1440,39 @@ export default function DashboardPage() {
                           />
                           <h3 className="font-semibold text-sm">{scr.name}</h3>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => handleUnpairScreen(scr.id)}
-                          className="text-xs text-neutral-500 hover:text-red-400"
-                        >
-                          Desvincular
-                        </button>
+                        {isAgency && (
+                          <button
+                            type="button"
+                            onClick={() => handleUnpairScreen(scr.id)}
+                            className="text-xs text-neutral-500 hover:text-red-400"
+                          >
+                            Desvincular
+                          </button>
+                        )}
                       </div>
 
                       <p className="text-xs text-neutral-500">
                         Estado: {scr.currentStatus || scr.status || 'Activo'} • Código:{' '}
                         <span className="font-mono">{scr.pairingCode}</span>
                       </p>
+
+                      {/* Asignación de Comercio (Solo Agencia) */}
+                      {isAgency && (
+                        <select
+                          value={scr.clientId || ''}
+                          onChange={(e) =>
+                            handleUpdateScreen(scr.id, { clientId: e.target.value })
+                          }
+                          className="w-full bg-neutral-900 border border-neutral-700 rounded-lg px-2.5 py-1.5 text-xs text-indigo-300"
+                        >
+                          <option value="">Comercio: Sin asignar (Agencia)</option>
+                          {clients.map((c) => (
+                            <option key={c.id} value={c.id}>
+                              Comercio: {c.name}
+                            </option>
+                          ))}
+                        </select>
+                      )}
 
                       <div className="grid grid-cols-2 gap-2">
                         <select
@@ -1051,7 +1483,7 @@ export default function DashboardPage() {
                           className="bg-neutral-900 border border-neutral-700 rounded-lg px-2.5 py-1.5 text-xs"
                         >
                           <option value="">-- Sin canal --</option>
-                          {channels.map((c) => (
+                          {screenChannels.map((c) => (
                             <option key={c.id} value={c.id}>
                               {c.name}
                             </option>

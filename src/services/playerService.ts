@@ -46,7 +46,7 @@ export async function initializeDevice(): Promise<{ screenId: string; deviceToke
         pairingCode: generatePairingCode(6),
         deviceToken,
         name: 'Nueva Pantalla TV',
-        channelId: null,
+        channelId: '',
         isPaired: false,
         rotation: 0,
         command: 'playing',
