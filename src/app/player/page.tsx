@@ -19,6 +19,11 @@ export default function PlayerPage() {
   const [isOnline, setIsOnline] = useState<boolean>(true);
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
 
+  // Transición suave (Crossfade 0.5s) entre spots
+  const [outgoingItem, setOutgoingItem] = useState<MediaItem | null>(null);
+  const [outgoingFading, setOutgoingFading] = useState<boolean>(false);
+  const lastItemRef = useRef<MediaItem | null>(null);
+
   const cacheManagerRef = useRef<MediaCacheManager | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
@@ -33,9 +38,12 @@ export default function PlayerPage() {
 
     let wakeLock: WakeLockSentinel | null = null;
     if ('wakeLock' in navigator) {
-      navigator.wakeLock.request('screen').then((lock) => {
-        wakeLock = lock;
-      }).catch(() => {});
+      navigator.wakeLock
+        .request('screen')
+        .then((lock) => {
+          wakeLock = lock;
+        })
+        .catch(() => {});
     }
 
     const savedScreen = localStorage.getItem(LOCAL_SCREEN_BACKUP);
@@ -116,7 +124,32 @@ export default function PlayerPage() {
   const safeIndex = playableItems.length > 0 ? currentIndex % playableItems.length : 0;
   const currentItem = playableItems[safeIndex] || null;
 
-  // Controla Play / Pausa real en videos MP4 y evita bloqueo de autoplay del navegador
+  // Ejecutar crossfade suave al cambiar de spot
+  useEffect(() => {
+    const prev = lastItemRef.current;
+    if (prev && currentItem && prev.id !== currentItem.id) {
+      setOutgoingItem(prev);
+      setOutgoingFading(false);
+
+      const raf = requestAnimationFrame(() => {
+        setOutgoingFading(true);
+      });
+      const cleanupTimer = setTimeout(() => {
+        setOutgoingItem(null);
+        setOutgoingFading(false);
+      }, 520);
+
+      lastItemRef.current = currentItem;
+      return () => {
+        cancelAnimationFrame(raf);
+        clearTimeout(cleanupTimer);
+      };
+    }
+
+    lastItemRef.current = currentItem;
+  }, [currentItem]);
+
+  // Controla Play / Pausa real en videos MP4 y evita bloqueo de autoplay
   useEffect(() => {
     const videoEl = videoRef.current;
     if (!videoEl || currentItem?.type !== 'video') return;
@@ -186,9 +219,7 @@ export default function PlayerPage() {
           <div className="inline-block px-4 py-1.5 rounded-full bg-emerald-500/10 text-emerald-400 text-sm font-medium mb-6">
             Listo para vincular
           </div>
-          <h1 className="text-3xl font-bold tracking-tight mb-3">
-            Conectar esta pantalla
-          </h1>
+          <h1 className="text-3xl font-bold tracking-tight mb-3">Conectar esta pantalla</h1>
           <p className="text-neutral-400 mb-8">
             Ingresá este código en tu panel de control para asignar un canal de contenido:
           </p>
@@ -200,7 +231,9 @@ export default function PlayerPage() {
           </div>
 
           <div className="flex items-center justify-center gap-2 text-xs text-neutral-500">
-            <span className={`w-2 h-2 rounded-full ${isOnline ? 'bg-emerald-500' : 'bg-amber-500'}`} />
+            <span
+              className={`w-2 h-2 rounded-full ${isOnline ? 'bg-emerald-500' : 'bg-amber-500'}`}
+            />
             <span>{isOnline ? 'Conectado al servidor' : 'Sin conexión a internet'}</span>
           </div>
         </div>
@@ -214,45 +247,78 @@ export default function PlayerPage() {
 
   return (
     <div className="fixed inset-0 bg-black overflow-hidden flex items-center justify-center cursor-none select-none">
-      <div style={containerStyle} className="relative bg-black flex items-center justify-center overflow-hidden">
+      <div
+        style={containerStyle}
+        className="relative bg-black flex items-center justify-center overflow-hidden"
+      >
         {!currentItem ? (
           <div className="text-center text-neutral-400">
             <p className="text-2xl font-semibold text-white mb-2">{screen.name}</p>
-            <p>{isSyncing ? 'Descargando contenidos...' : 'Canal asignado sin contenidos activos'}</p>
+            <p>
+              {isSyncing ? 'Descargando contenidos...' : 'Canal asignado sin contenidos activos'}
+            </p>
           </div>
         ) : (
           <>
-            {currentItem.type === 'image' && (
-              <img
-                key={currentItem.id}
-                src={blobUrls[currentItem.url] || currentItem.url}
-                alt={currentItem.title}
-                className="w-full h-full object-contain"
-              />
-            )}
+            {/* Capa actual */}
+            <div className="absolute inset-0 flex items-center justify-center">
+              {currentItem.type === 'image' && (
+                <img
+                  key={currentItem.id}
+                  src={blobUrls[currentItem.url] || currentItem.url}
+                  alt={currentItem.title}
+                  className="w-full h-full object-contain"
+                />
+              )}
 
-            {currentItem.type === 'video' && (
-              <video
-                ref={videoRef}
-                key={currentItem.id}
-                src={blobUrls[currentItem.url] || currentItem.url}
-                autoPlay={screen.command === 'playing'}
-                loop
-                playsInline
-                className="w-full h-full object-contain"
-              />
-            )}
+              {currentItem.type === 'video' && (
+                <video
+                  ref={videoRef}
+                  key={currentItem.id}
+                  src={blobUrls[currentItem.url] || currentItem.url}
+                  autoPlay={screen.command === 'playing'}
+                  loop
+                  playsInline
+                  className="w-full h-full object-contain"
+                />
+              )}
 
-            {currentItem.type === 'youtube' && currentItem.youtubeId && (
-              <iframe
-                key={currentItem.id}
-                className="w-full h-full pointer-events-none"
-                src={`https://www.youtube.com/embed/${currentItem.youtubeId}?autoplay=${
-                  screen.command === 'playing' ? 1 : 0
-                }&mute=1&controls=0&rel=0&modestbranding=1&iv_load_policy=3&playsinline=1`}
-                title={currentItem.title}
-                allow="autoplay; encrypted-media"
-              />
+              {currentItem.type === 'youtube' && currentItem.youtubeId && (
+                <iframe
+                  key={currentItem.id}
+                  className="w-full h-full pointer-events-none"
+                  src={`https://www.youtube.com/embed/${currentItem.youtubeId}?autoplay=${
+                    screen.command === 'playing' ? 1 : 0
+                  }&mute=1&controls=0&rel=0&modestbranding=1&iv_load_policy=3&playsinline=1`}
+                  title={currentItem.title}
+                  allow="autoplay; encrypted-media"
+                />
+              )}
+            </div>
+
+            {/* Capa anterior disolviéndose suavemente (0.5s) */}
+            {outgoingItem && (
+              <div
+                className={`absolute inset-0 bg-black flex items-center justify-center pointer-events-none transition-opacity duration-500 ${
+                  outgoingFading ? 'opacity-0' : 'opacity-100'
+                }`}
+              >
+                {outgoingItem.type === 'image' && (
+                  <img
+                    src={blobUrls[outgoingItem.url] || outgoingItem.url}
+                    alt={outgoingItem.title}
+                    className="w-full h-full object-contain"
+                  />
+                )}
+                {outgoingItem.type === 'video' && (
+                  <video
+                    src={blobUrls[outgoingItem.url] || outgoingItem.url}
+                    muted
+                    playsInline
+                    className="w-full h-full object-contain"
+                  />
+                )}
+              </div>
             )}
           </>
         )}

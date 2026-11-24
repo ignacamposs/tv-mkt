@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import {
   collection,
   doc,
@@ -71,6 +71,15 @@ export default function DashboardPage() {
   const [itemUrl, setItemUrl] = useState<string>('');
   const [itemDuration, setItemDuration] = useState<number>(10);
   const [isUploading, setIsUploading] = useState<boolean>(false);
+
+  // Simulador / Vista Previa en Vivo
+  const [previewAspect, setPreviewAspect] = useState<'16:9' | '9:16'>('16:9');
+  const [previewPlaying, setPreviewPlaying] = useState<boolean>(true);
+  const [previewIndex, setPreviewIndex] = useState<number>(0);
+  const [previewElapsedMs, setPreviewElapsedMs] = useState<number>(0);
+  const [outgoingPreviewItem, setOutgoingPreviewItem] = useState<MediaItem | null>(null);
+  const [outgoingPreviewFading, setOutgoingPreviewFading] = useState<boolean>(false);
+  const lastPreviewItemRef = useRef<MediaItem | null>(null);
 
   // Pantallas vinculadas
   const [screens, setScreens] = useState<ScreenWithMeta[]>([]);
@@ -156,6 +165,57 @@ export default function DashboardPage() {
 
     return () => unsub();
   }, []);
+
+  // Lógica del Loop y barra de progreso en Vista Previa
+  const safePreviewIndex = draftItems.length > 0 ? previewIndex % draftItems.length : 0;
+  const activePreviewItem = draftItems[safePreviewIndex] || null;
+  const activePreviewDurationMs = Math.max(activePreviewItem?.duration || 10, 2) * 1000;
+
+  useEffect(() => {
+    setPreviewElapsedMs(0);
+  }, [activePreviewItem?.id, selectedChannelId]);
+
+  useEffect(() => {
+    if (!activePreviewItem || !previewPlaying || draftItems.length === 0) return;
+
+    const tick = 100;
+    const interval = setInterval(() => {
+      setPreviewElapsedMs((prev) => {
+        if (prev + tick >= activePreviewDurationMs) {
+          setPreviewIndex((idx) => (idx + 1) % draftItems.length);
+          return 0;
+        }
+        return prev + tick;
+      });
+    }, tick);
+
+    return () => clearInterval(interval);
+  }, [activePreviewItem, activePreviewDurationMs, previewPlaying, draftItems.length]);
+
+  // Transición suave (Crossfade 0.5s) en Vista Previa
+  useEffect(() => {
+    const prev = lastPreviewItemRef.current;
+    if (prev && activePreviewItem && prev.id !== activePreviewItem.id) {
+      setOutgoingPreviewItem(prev);
+      setOutgoingPreviewFading(false);
+
+      const raf = requestAnimationFrame(() => {
+        setOutgoingPreviewFading(true);
+      });
+      const cleanupTimer = setTimeout(() => {
+        setOutgoingPreviewItem(null);
+        setOutgoingPreviewFading(false);
+      }, 520);
+
+      lastPreviewItemRef.current = activePreviewItem;
+      return () => {
+        cancelAnimationFrame(raf);
+        clearTimeout(cleanupTimer);
+      };
+    }
+
+    lastPreviewItemRef.current = activePreviewItem;
+  }, [activePreviewItem]);
 
   const handleUnlock = (e: React.FormEvent) => {
     e.preventDefault();
@@ -427,19 +487,37 @@ export default function DashboardPage() {
     );
   }
 
+  const progressPercent = Math.min(
+    100,
+    Math.round((previewElapsedMs / activePreviewDurationMs) * 100)
+  );
+  const remainingSec = Math.max(
+    0,
+    Math.ceil((activePreviewDurationMs - previewElapsedMs) / 1000)
+  );
+
   return (
     <div className="min-h-screen bg-neutral-950 text-white p-6 md:p-10">
-      <div className="max-w-6xl mx-auto space-y-8">
+      <div className="max-w-7xl mx-auto space-y-8">
         {/* Header */}
         <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-neutral-800 pb-6">
           <div>
             <h1 className="text-2xl font-bold tracking-tight">Gestión de Cartelería Digital</h1>
             <p className="text-sm text-neutral-400">
-              Control remoto de canales, contenidos y televisores en tiempo real
+              Control remoto de canales, previsualización en vivo y televisores en tiempo real
             </p>
           </div>
 
           <div className="flex items-center gap-3">
+            <a
+              href="/player"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="bg-neutral-900 hover:bg-neutral-800 border border-neutral-700 px-4 py-2 rounded-xl text-sm font-medium text-emerald-400 transition"
+            >
+              Simular TV (/player) ↗
+            </a>
+
             {showPinEditor ? (
               <form onSubmit={handleSaveNewPin} className="flex items-center gap-2">
                 <input
@@ -487,7 +565,7 @@ export default function DashboardPage() {
         )}
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-          {/* Columna Izquierda: Canales y Playlist */}
+          {/* Columna Izquierda: Canales, Vista Previa y Playlist */}
           <section className="lg:col-span-7 bg-neutral-900 border border-neutral-800 rounded-2xl p-6 space-y-6">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <h2 className="text-lg font-semibold">Canales y Programación</h2>
@@ -526,6 +604,7 @@ export default function DashboardPage() {
                       onClick={() => {
                         setHasChanges(false);
                         setSelectedChannelId(ch.id);
+                        setPreviewIndex(0);
                       }}
                       className="px-4 py-2 font-medium"
                     >
@@ -546,6 +625,170 @@ export default function DashboardPage() {
               <p className="text-sm text-neutral-500">
                 Creá tu primer canal para empezar a cargar imágenes o videos.
               </p>
+            )}
+
+            {/* Monitor de Previsualización en Vivo */}
+            {selectedChannelId && (
+              <div className="bg-neutral-950 border border-neutral-800 rounded-2xl p-4 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-semibold uppercase tracking-wider text-neutral-400">
+                      Vista Previa del Loop
+                    </span>
+                    <span
+                      className={`text-[11px] px-2 py-0.5 rounded-full font-medium ${
+                        hasChanges
+                          ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                          : 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+                      }`}
+                    >
+                      {hasChanges ? 'Borrador sin publicar' : 'Publicado'}
+                    </span>
+                  </div>
+
+                  {/* Selector de Formato Horizontal / Vertical */}
+                  <div className="flex items-center gap-1 bg-neutral-900 p-1 rounded-lg border border-neutral-800">
+                    <button
+                      type="button"
+                      onClick={() => setPreviewAspect('16:9')}
+                      className={`px-2.5 py-1 rounded text-xs font-medium transition ${
+                        previewAspect === '16:9'
+                          ? 'bg-neutral-700 text-white'
+                          : 'text-neutral-400 hover:text-white'
+                      }`}
+                    >
+                      Horizontal 16:9
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPreviewAspect('9:16')}
+                      className={`px-2.5 py-1 rounded text-xs font-medium transition ${
+                        previewAspect === '9:16'
+                          ? 'bg-neutral-700 text-white'
+                          : 'text-neutral-400 hover:text-white'
+                      }`}
+                    >
+                      Vertical 9:16
+                    </button>
+                  </div>
+                </div>
+
+                {/* Marco de pantalla simulada */}
+                <div className="w-full bg-black/80 rounded-xl p-4 flex items-center justify-center border border-neutral-900">
+                  <div
+                    className={`relative bg-black border-2 border-neutral-800 rounded-lg overflow-hidden shadow-2xl flex items-center justify-center transition-all duration-300 ${
+                      previewAspect === '16:9'
+                        ? 'w-full aspect-video'
+                        : 'w-52 sm:w-60 aspect-[9/16]'
+                    }`}
+                  >
+                    {!activePreviewItem ? (
+                      <div className="text-center px-4 text-xs text-neutral-500">
+                        Agregá una imagen, video o YouTube para previsualizar cómo se verá en el TV.
+                      </div>
+                    ) : (
+                      <>
+                        {/* Capa entrante (siempre activa debajo) */}
+                        <div className="absolute inset-0 flex items-center justify-center">
+                          {activePreviewItem.type === 'image' && (
+                            <img
+                              key={`in-${activePreviewItem.id}`}
+                              src={activePreviewItem.url}
+                              alt={activePreviewItem.title}
+                              className="w-full h-full object-contain"
+                            />
+                          )}
+                          {activePreviewItem.type === 'video' && (
+                            <video
+                              key={`in-${activePreviewItem.id}`}
+                              src={activePreviewItem.url}
+                              autoPlay={previewPlaying}
+                              muted
+                              loop
+                              playsInline
+                              className="w-full h-full object-contain"
+                            />
+                          )}
+                          {activePreviewItem.type === 'youtube' &&
+                            activePreviewItem.youtubeId && (
+                              <iframe
+                                key={`in-${activePreviewItem.id}`}
+                                className="w-full h-full pointer-events-none"
+                                src={`https://www.youtube.com/embed/${activePreviewItem.youtubeId}?autoplay=${
+                                  previewPlaying ? 1 : 0
+                                }&mute=1&controls=0&rel=0&modestbranding=1&playsinline=1`}
+                                title={activePreviewItem.title}
+                                allow="autoplay; encrypted-media"
+                              />
+                            )}
+                        </div>
+
+                        {/* Capa saliente (fundido suave de 0.5s al cambiar de spot) */}
+                        {outgoingPreviewItem && (
+                          <div
+                            className={`absolute inset-0 bg-black flex items-center justify-center pointer-events-none transition-opacity duration-500 ${
+                              outgoingPreviewFading ? 'opacity-0' : 'opacity-100'
+                            }`}
+                          >
+                            {outgoingPreviewItem.type === 'image' && (
+                              <img
+                                src={outgoingPreviewItem.url}
+                                alt={outgoingPreviewItem.title}
+                                className="w-full h-full object-contain"
+                              />
+                            )}
+                            {outgoingPreviewItem.type === 'video' && (
+                              <video
+                                src={outgoingPreviewItem.url}
+                                muted
+                                playsInline
+                                className="w-full h-full object-contain"
+                              />
+                            )}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* Barra de progreso y controles de simulación */}
+                {activePreviewItem && (
+                  <div className="space-y-2">
+                    <div className="w-full h-1.5 bg-neutral-800 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-emerald-500 transition-all duration-100"
+                        style={{ width: `${progressPercent}%` }}
+                      />
+                    </div>
+                    <div className="flex items-center justify-between text-xs text-neutral-400">
+                      <span className="truncate max-w-[60%]">
+                        Spot {safePreviewIndex + 1}/{draftItems.length}:{' '}
+                        <strong className="text-neutral-200">{activePreviewItem.title}</strong> (
+                        {remainingSec}s)
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setPreviewPlaying((p) => !p)}
+                          className="px-2.5 py-1 rounded bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-neutral-200"
+                        >
+                          {previewPlaying ? '⏸ Pausar' : '▶ Reproducir'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setPreviewIndex((idx) => (idx + 1) % draftItems.length)
+                          }
+                          className="px-2.5 py-1 rounded bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-neutral-200"
+                        >
+                          Siguiente ⏭
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
             )}
 
             {/* Formulario agregar contenido */}
@@ -648,53 +891,64 @@ export default function DashboardPage() {
                   </div>
                 ) : (
                   <ul className="space-y-2">
-                    {draftItems.map((item, idx) => (
-                      <li
-                        key={item.id}
-                        className="flex items-center justify-between gap-3 bg-neutral-950 border border-neutral-800 rounded-xl p-3"
-                      >
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2">
-                            <span className="text-xs font-mono uppercase px-2 py-0.5 rounded bg-neutral-800 text-neutral-300">
-                              {item.type}
-                            </span>
-                            <p className="font-medium text-sm truncate">{item.title}</p>
+                    {draftItems.map((item, idx) => {
+                      const isCurrentInPreview = activePreviewItem?.id === item.id;
+                      return (
+                        <li
+                          key={item.id}
+                          onClick={() => setPreviewIndex(idx)}
+                          className={`cursor-pointer flex items-center justify-between gap-3 bg-neutral-950 border rounded-xl p-3 transition ${
+                            isCurrentInPreview
+                              ? 'border-emerald-500/60 bg-emerald-950/10'
+                              : 'border-neutral-800 hover:border-neutral-700'
+                          }`}
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs font-mono uppercase px-2 py-0.5 rounded bg-neutral-800 text-neutral-300">
+                                {item.type}
+                              </span>
+                              <p className="font-medium text-sm truncate">{item.title}</p>
+                            </div>
+                            <p className="text-xs text-neutral-500 truncate mt-1">
+                              {item.duration}s • {item.url}
+                            </p>
                           </div>
-                          <p className="text-xs text-neutral-500 truncate mt-1">
-                            {item.duration}s • {item.url}
-                          </p>
-                        </div>
 
-                        <div className="flex items-center gap-1">
-                          <button
-                            type="button"
-                            onClick={() => handleMoveItem(idx, -1)}
-                            disabled={idx === 0}
-                            className="p-1.5 text-neutral-400 hover:text-white disabled:opacity-30"
-                            title="Subir"
+                          <div
+                            className="flex items-center gap-1"
+                            onClick={(e) => e.stopPropagation()}
                           >
-                            ↑
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleMoveItem(idx, 1)}
-                            disabled={idx === draftItems.length - 1}
-                            className="p-1.5 text-neutral-400 hover:text-white disabled:opacity-30"
-                            title="Bajar"
-                          >
-                            ↓
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleRemoveItem(item.id)}
-                            className="p-1.5 text-red-400 hover:text-red-300 ml-1"
-                            title="Eliminar"
-                          >
-                            🗑
-                          </button>
-                        </div>
-                      </li>
-                    ))}
+                            <button
+                              type="button"
+                              onClick={() => handleMoveItem(idx, -1)}
+                              disabled={idx === 0}
+                              className="p-1.5 text-neutral-400 hover:text-white disabled:opacity-30"
+                              title="Subir"
+                            >
+                              ↑
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleMoveItem(idx, 1)}
+                              disabled={idx === draftItems.length - 1}
+                              className="p-1.5 text-neutral-400 hover:text-white disabled:opacity-30"
+                              title="Bajar"
+                            >
+                              ↓
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveItem(item.id)}
+                              className="p-1.5 text-red-400 hover:text-red-300 ml-1"
+                              title="Eliminar"
+                            >
+                              🗑
+                            </button>
+                          </div>
+                        </li>
+                      );
+                    })}
                   </ul>
                 )}
               </div>
@@ -709,7 +963,21 @@ export default function DashboardPage() {
               onSubmit={handlePairScreen}
               className="bg-neutral-950 border border-neutral-800 rounded-xl p-4 space-y-3"
             >
-              <p className="text-sm font-medium text-neutral-300">Vincular nueva pantalla</p>
+              <div className="flex items-center justify-between">
+                <p className="text-sm font-medium text-neutral-300">Vincular nueva pantalla</p>
+                <a
+                  href="/player"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-xs text-emerald-400 hover:underline"
+                >
+                  Obtener código en /player ↗
+                </a>
+              </div>
+              <p className="text-xs text-neutral-500">
+                Abrí <code className="text-neutral-300">/player</code> en el televisor (o en una
+                pestaña nueva) e ingresá el código de 6 dígitos que muestra en pantalla.
+              </p>
               <div className="grid grid-cols-2 gap-2">
                 <input
                   type="text"
@@ -738,8 +1006,7 @@ export default function DashboardPage() {
 
             {screens.length === 0 ? (
               <p className="text-sm text-neutral-500 text-center py-6">
-                No hay pantallas vinculadas. Abrí <code className="text-neutral-300">/player</code>{' '}
-                en un televisor para ver su código.
+                No hay pantallas vinculadas todavía.
               </p>
             ) : (
               <div className="space-y-4">
