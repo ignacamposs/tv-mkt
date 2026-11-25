@@ -1,42 +1,84 @@
 export type MediaType = 'image' | 'video' | 'youtube';
+export type ScreenCommand = 'playing' | 'paused' | 'blackout';
+export type ScreenRotation = 0 | 90 | 180 | 270;
+export type UserRole = 'agency' | 'client';
+
+export interface UserProfile {
+  uid: string;
+  email: string;
+  role: UserRole;
+  clientId?: string;
+  name?: string;
+}
+
+export interface ClientAccount {
+  id: string;
+  name: string;
+  email: string;
+  ownerUid: string;
+  active: boolean;
+  createdAt?: unknown;
+}
 
 export interface MediaItem {
   id: string;
-  type: MediaType;
   title: string;
+  type: MediaType;
   url: string;
   youtubeId?: string;
-  duration: number; // Segundos en pantalla
+  duration: number;
   order: number;
+  createdBy?: UserRole;
 }
 
 export interface Channel {
   id: string;
   name: string;
   items: MediaItem[];
-  updatedAt: number;
-  lastAuthorizedBy?: string;
+  clientId?: string;
 }
-
-export type ScreenRotation = 0 | 90 | 180 | 270;
-export type PlaybackCommand = 'playing' | 'paused' | 'blackout';
 
 export interface ScreenTelemetry {
   lastSeen: number;
   isNetworkOnline: boolean;
   currentItemTitle: string;
+  currentItemId?: string;
   cachedItemsCount: number;
   appVersion: string;
 }
 
+export interface CallerEntry {
+  id: string;
+  ticket: string;      // Ej: "A-014" o "MARÍA GÓMEZ"
+  destination: string; // Ej: "CAJA 2" o "CONSULTORIO 4"
+  timestamp: number;
+}
+
+export interface CallerState {
+  current?: CallerEntry | null;
+  history: CallerEntry[];
+  prefix?: string;
+  lastNumber?: number;
+  defaultDestination?: string;
+  voiceEnabled?: boolean;
+  updatedAt?: number;
+}
+
 export interface Screen {
   id: string;
-  pairingCode: string;
-  deviceToken: string;
   name: string;
-  channelId: string | null;
+  pairingCode: string;
+  deviceToken?: string;
   isPaired: boolean;
+  channelId: string;
+  clientId?: string;
+  command: ScreenCommand;
   rotation: ScreenRotation;
-  command: PlaybackCommand;
-  telemetry: ScreenTelemetry;
+  callerEnabled?: boolean;
+  callerState?: CallerState;
+  telemetry?: ScreenTelemetry;
+  lastSeen?: unknown;
+  status?: string;
+  currentStatus?: string;
+  cachedCount?: number;
 }

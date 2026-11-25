@@ -1,5 +1,6 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore, initializeFirestore } from 'firebase/firestore';
+import { getFirestore } from 'firebase/firestore';
+import { getAuth } from 'firebase/auth';
 
 const firebaseConfig = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -10,9 +11,14 @@ const firebaseConfig = {
   appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
 };
 
-const isNewApp = !getApps().length;
-const app = isNewApp ? initializeApp(firebaseConfig) : getApp();
+const app = getApps().some((a) => a.name === '[DEFAULT]')
+  ? getApp()
+  : initializeApp(firebaseConfig);
 
-export const db = isNewApp
-  ? initializeFirestore(app, { experimentalForceLongPolling: true })
-  : getFirestore(app);
+const secondaryApp = getApps().some((a) => a.name === 'secondary')
+  ? getApp('secondary')
+  : initializeApp(firebaseConfig, 'secondary');
+
+export const db = getFirestore(app);
+export const auth = getAuth(app);
+export const secondaryAuth = getAuth(secondaryApp);
