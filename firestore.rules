@@ -41,6 +41,7 @@ service cloud.firestore {
     }
 
     // Canales de reproducción
+    // 'get' abierto para que el /player del TV lea su canal asignado sin login
     match /channels/{channelId} {
       allow get: if true;
       allow list: if isSignedIn();
@@ -52,14 +53,15 @@ service cloud.firestore {
 
     // Pantallas y Televisores
     match /screens/{screenId} {
-      allow get, list: if true;
+      allow get: if true;
+      allow list: if isSignedIn();
       // Permite que un TV nuevo genere su código de vinculación al abrir /player
       allow create: if true;
-      // Agencia edita todo; Comercio edita sus TVs; /player y /llamador solo telemetría y cola de turnos
+      // Agencia edita todo; Comercio edita sus TVs; TV sin login solo actualiza telemetría
       allow update: if isAgency()
         || (isClient() && resource.data.clientId == myClientId())
         || (!isSignedIn() && request.resource.data.diff(resource.data).affectedKeys()
-            .hasOnly(['telemetry', 'lastSeen', 'currentStatus', 'status', 'cachedCount', 'callerState']));
+            .hasOnly(['telemetry', 'lastSeen', 'currentStatus', 'status', 'cachedCount']));
       allow delete: if isAgency();
     }
 

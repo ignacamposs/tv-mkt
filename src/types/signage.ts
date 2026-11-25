@@ -74,8 +74,6 @@ export interface Screen {
   clientId?: string;
   command: ScreenCommand;
   rotation: ScreenRotation;
-  callerEnabled?: boolean;
-  callerState?: CallerState;
   telemetry?: ScreenTelemetry;
   lastSeen?: unknown;
   status?: string;

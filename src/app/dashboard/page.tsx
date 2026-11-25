@@ -594,7 +594,7 @@ export default function DashboardPage() {
     setHasChanges(true);
   };
 
-  // Replicar un spot bloqueado de Agencia en todos los comercios
+  // Replicar un spot bloqueado de Agencia en todos los comercios (creando canal si falta)
   const handleReplicateAgencyAdToAllClients = async (adItem: MediaItem) => {
     if (profile?.role !== 'agency') return;
     if (clients.length === 0) {
@@ -857,8 +857,6 @@ export default function DashboardPage() {
     const assignedChannel = channels.find((c) => c.id === scr.channelId);
     const liveItem = resolveLiveItemForScreen(scr, assignedChannel, now);
     const isVertical = scr.rotation === 90 || scr.rotation === 270;
-    const callerActive = Boolean(scr.callerEnabled);
-    const activeTicket = scr.callerState?.current;
 
     return (
       <div
@@ -947,15 +945,6 @@ export default function DashboardPage() {
           <span className="absolute top-1.5 right-1.5 text-[9px] font-mono bg-black/75 text-neutral-400 px-1.5 py-0.5 rounded border border-neutral-800">
             {isVertical ? '9:16' : '16:9'} • {scr.pairingCode}
           </span>
-
-          {/* Indicador flotante si el llamador está activo */}
-          {callerActive && (
-            <span className="absolute bottom-1.5 left-1.5 right-1.5 text-[10px] font-medium bg-amber-500/90 text-black px-2 py-0.5 rounded truncate text-center shadow">
-              {activeTicket
-                ? `🔔 ${activeTicket.ticket} → ${activeTicket.destination}`
-                : '🔔 Llamador de turnos activo'}
-            </span>
-          )}
         </div>
 
         {/* Info del spot actual */}
@@ -987,15 +976,12 @@ export default function DashboardPage() {
             <option value="">-- Sin canal asignado --</option>
             {channels.map((c) => (
               <option key={c.id} value={c.id}>
-                {c.name}{' '}
-                {c.clientId && clientNameMap[c.clientId]
-                  ? `(${clientNameMap[c.clientId]})`
-                  : ''}
+                {c.name} {c.clientId && clientNameMap[c.clientId] ? `(${clientNameMap[c.clientId]})` : ''}
               </option>
             ))}
           </select>
 
-          {/* Controles instantáneos + Interruptor Llamador */}
+          {/* Controles instantáneos */}
           <div className="flex items-center gap-1.5 pt-0.5">
             <button
               type="button"
@@ -1045,20 +1031,6 @@ export default function DashboardPage() {
             >
               {scr.rotation || 0}°
             </button>
-            <button
-              type="button"
-              onClick={() =>
-                handleUpdateScreen(scr.id, { callerEnabled: !callerActive })
-              }
-              title="Activar o desactivar columna de turnos en este TV"
-              className={`px-2 py-1 rounded-md text-[11px] font-semibold border transition ${
-                callerActive
-                  ? 'bg-amber-500/20 border-amber-500/50 text-amber-300'
-                  : 'bg-neutral-900 border-neutral-800 text-neutral-500 hover:text-neutral-300'
-              }`}
-            >
-              {callerActive ? '🔔 ON' : '🔕 OFF'}
-            </button>
           </div>
         </div>
       </div>
@@ -1089,15 +1061,6 @@ export default function DashboardPage() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5">
-            <a
-              href="/llamador"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="bg-neutral-900 hover:bg-neutral-800 border border-neutral-700 px-3.5 py-2 rounded-xl text-xs font-medium text-amber-300 transition"
-            >
-              🔔 Llamador (/llamador) ↗
-            </a>
-
             <a
               href="/player"
               target="_blank"
@@ -1285,10 +1248,7 @@ export default function DashboardPage() {
                       return clientScreens.some(isScreenOnline);
                     }
                     if (liveStatusFilter === 'offline') {
-                      return (
-                        clientScreens.length === 0 ||
-                        clientScreens.some((s) => !isScreenOnline(s))
-                      );
+                      return clientScreens.length === 0 || clientScreens.some((s) => !isScreenOnline(s));
                     }
                     return true;
                   })
@@ -1351,9 +1311,7 @@ export default function DashboardPage() {
                         ) : (
                           <div
                             className={`grid gap-3.5 ${
-                              clientScreens.length === 1
-                                ? 'grid-cols-1'
-                                : 'grid-cols-1 sm:grid-cols-2'
+                              clientScreens.length === 1 ? 'grid-cols-1' : 'grid-cols-1 sm:grid-cols-2'
                             }`}
                           >
                             {clientScreens.map((scr) => renderLiveMonitorCard(scr))}
@@ -1397,9 +1355,7 @@ export default function DashboardPage() {
 
                       <div
                         className={`grid gap-3.5 ${
-                          agencyScreens.length === 1
-                            ? 'grid-cols-1'
-                            : 'grid-cols-1 sm:grid-cols-2'
+                          agencyScreens.length === 1 ? 'grid-cols-1' : 'grid-cols-1 sm:grid-cols-2'
                         }`}
                       >
                         {agencyScreens.map((scr) => renderLiveMonitorCard(scr))}
@@ -1434,7 +1390,7 @@ export default function DashboardPage() {
                   type="text"
                   value={newClientName}
                   onChange={(e) => setNewClientName(e.target.value)}
-                  placeholder="Nombre (ej. Farmacia Central)"
+                  placeholder="Nombre (ej. Gym Norte)"
                   className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm"
                 />
                 <input
@@ -1534,7 +1490,7 @@ export default function DashboardPage() {
                     type="text"
                     value={newScreenName}
                     onChange={(e) => setNewScreenName(e.target.value)}
-                    placeholder="Nombre (ej. Sala Espera)"
+                    placeholder="Nombre (ej. Vidriera)"
                     className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm"
                   />
                 </div>
@@ -2105,7 +2061,7 @@ export default function DashboardPage() {
                     type="text"
                     value={newScreenName}
                     onChange={(e) => setNewScreenName(e.target.value)}
-                    placeholder="Nombre (ej. Sala Espera)"
+                    placeholder="Nombre (ej. Vidriera)"
                     className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm"
                   />
                 </div>
@@ -2142,7 +2098,6 @@ export default function DashboardPage() {
                 <div className="space-y-4">
                   {visibleScreens.map((scr) => {
                     const online = isScreenOnline(scr);
-                    const callerActive = Boolean(scr.callerEnabled);
                     const screenChannels = isAgency
                       ? channels
                       : channels.filter((c) => c.clientId === profile.clientId);
@@ -2225,22 +2180,6 @@ export default function DashboardPage() {
                             <option value={270}>Vertical (270°)</option>
                           </select>
                         </div>
-
-                        {/* Interruptor Modo Llamador (Farmacia / Clínica) */}
-                        <button
-                          type="button"
-                          onClick={() =>
-                            handleUpdateScreen(scr.id, { callerEnabled: !callerActive })
-                          }
-                          className={`w-full py-2 px-3 rounded-lg text-xs font-semibold border transition flex items-center justify-between ${
-                            callerActive
-                              ? 'bg-amber-500/15 border-amber-500/40 text-amber-300'
-                              : 'bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-neutral-200'
-                          }`}
-                        >
-                          <span>🔔 Modo Llamador de Turnos (Pantalla Dividida)</span>
-                          <span>{callerActive ? 'ACTIVADO' : 'APAGADO'}</span>
-                        </button>
 
                         <div className="flex gap-2 pt-1">
                           <button

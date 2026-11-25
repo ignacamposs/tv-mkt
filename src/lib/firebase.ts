@@ -1,5 +1,5 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore } from 'firebase/firestore';
+import { getFirestore, initializeFirestore } from 'firebase/firestore';
 import { getAuth } from 'firebase/auth';
 
 const firebaseConfig = {
@@ -11,14 +11,20 @@ const firebaseConfig = {
   appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
 };
 
-const app = getApps().some((a) => a.name === '[DEFAULT]')
-  ? getApp()
-  : initializeApp(firebaseConfig);
+const existingDefault = getApps().find((a) => a.name === '[DEFAULT]');
+const app = existingDefault ? getApp() : initializeApp(firebaseConfig);
 
-const secondaryApp = getApps().some((a) => a.name === 'secondary')
-  ? getApp('secondary')
-  : initializeApp(firebaseConfig, 'secondary');
+export const db = existingDefault
+  ? getFirestore(app)
+  : initializeFirestore(app, { experimentalForceLongPolling: true });
 
-export const db = getFirestore(app);
 export const auth = getAuth(app);
+
+// Instancia secundaria para que la agencia cree usuarios de comercios sin cerrar su propia sesión
+const SECONDARY_APP_NAME = 'SecondaryClientCreator';
+const existingSecondary = getApps().find((a) => a.name === SECONDARY_APP_NAME);
+const secondaryApp = existingSecondary
+  ? getApp(SECONDARY_APP_NAME)
+  : initializeApp(firebaseConfig, SECONDARY_APP_NAME);
+
 export const secondaryAuth = getAuth(secondaryApp);
