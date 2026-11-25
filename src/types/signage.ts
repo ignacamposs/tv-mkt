@@ -49,8 +49,8 @@ export interface ScreenTelemetry {
 
 export interface CallerEntry {
   id: string;
-  ticket: string;      // Ej: "A-014" o "MARÍA GÓMEZ"
-  destination: string; // Ej: "CAJA 2" o "CONSULTORIO 4"
+  ticket: string;
+  destination: string;
   timestamp: number;
 }
 
@@ -74,6 +74,8 @@ export interface Screen {
   clientId?: string;
   command: ScreenCommand;
   rotation: ScreenRotation;
+  callerEnabled?: boolean;
+  callerState?: CallerState;
   telemetry?: ScreenTelemetry;
   lastSeen?: unknown;
   status?: string;
