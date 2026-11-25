@@ -7,7 +7,7 @@ export interface UserProfile {
   uid: string;
   email: string;
   role: UserRole;
-  clientId?: string; // Solo si role === 'client'
+  clientId?: string;
   name?: string;
 }
 
@@ -28,7 +28,7 @@ export interface MediaItem {
   youtubeId?: string;
   duration: number;
   order: number;
-  createdBy?: UserRole; // 'agency' = bloqueado para el comercio | 'client' = editable por el comercio
+  createdBy?: UserRole;
 }
 
 export interface Channel {
@@ -42,6 +42,7 @@ export interface ScreenTelemetry {
   lastSeen: number;
   isNetworkOnline: boolean;
   currentItemTitle: string;
+  currentItemId?: string;
   cachedItemsCount: number;
   appVersion: string;
 }
