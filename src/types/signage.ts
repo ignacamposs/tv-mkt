@@ -2,6 +2,7 @@ export type MediaType = 'image' | 'video' | 'youtube';
 export type ScreenCommand = 'playing' | 'paused' | 'blackout';
 export type ScreenRotation = 0 | 90 | 180 | 270;
 export type UserRole = 'agency' | 'client';
+export type CallerTheme = 'clinical' | 'broadcast' | 'editorial';
 
 export interface UserProfile {
   uid: string;
@@ -75,6 +76,7 @@ export interface Screen {
   command: ScreenCommand;
   rotation: ScreenRotation;
   callerEnabled?: boolean;
+  callerTheme?: CallerTheme;
   callerState?: CallerState;
   telemetry?: ScreenTelemetry;
   lastSeen?: unknown;

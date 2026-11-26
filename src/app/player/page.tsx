@@ -1,204 +1,82 @@
 'use client';
 
-import React, { useEffect, useState, useRef, useCallback } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import {
-  addDoc,
   collection,
   doc,
+  getDocs,
   onSnapshot,
+  query,
   updateDoc,
+  where,
 } from 'firebase/firestore';
 import { db } from '../../lib/firebase';
-import {
-  Channel,
-  MediaItem,
-  Screen,
-  ScreenTelemetry,
-} from '../../types/signage';
+import { getCallerTheme } from '../../lib/callerThemes';
+import { CallerEntry, CallerState, Screen } from '../../types/signage';
 
-const APP_VERSION = '1.2.0-caller';
-const STORAGE_SCREEN_ID = 'signage_screen_id';
-const STORAGE_DEVICE_TOKEN = 'signage_device_token';
+const STORAGE_SCREEN_ID_KEY = 'signage_caller_screen_id';
 
-function generatePairingCode(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let result = '';
-  for (let i = 0; i < 6; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
+function formatTicket(prefix: string, num: number): string {
+  const cleanPrefix = prefix.trim().toUpperCase();
+  const padded = String(Math.max(1, num)).padStart(3, '0');
+  return cleanPrefix ? `${cleanPrefix}-${padded}` : padded;
 }
 
-function generateDeviceToken(): string {
-  return `dev_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-}
-
-/**
- * Genera un timbre clásico "ding-dong" usando Web Audio API (funciona offline)
- */
-function playDoorbellChime() {
-  if (typeof window === 'undefined') return;
-  try {
-    const AudioCtx =
-      window.AudioContext ||
-      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    if (!AudioCtx) return;
-
-    const ctx = new AudioCtx();
-    if (ctx.state === 'suspended') {
-      ctx.resume().catch(() => {});
-    }
-
-    const now = ctx.currentTime;
-
-    // Primera nota: Mi5 (659.25 Hz)
-    const osc1 = ctx.createOscillator();
-    const gain1 = ctx.createGain();
-    osc1.type = 'sine';
-    osc1.frequency.setValueAtTime(659.25, now);
-    gain1.gain.setValueAtTime(0.001, now);
-    gain1.gain.exponentialRampToValueAtTime(0.28, now + 0.03);
-    gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.55);
-    osc1.connect(gain1);
-    gain1.connect(ctx.destination);
-    osc1.start(now);
-    osc1.stop(now + 0.56);
-
-    // Segunda nota: Do5 (523.25 Hz)
-    const osc2 = ctx.createOscillator();
-    const gain2 = ctx.createGain();
-    osc2.type = 'sine';
-    osc2.frequency.setValueAtTime(523.25, now + 0.35);
-    gain2.gain.setValueAtTime(0.001, now + 0.35);
-    gain2.gain.exponentialRampToValueAtTime(0.32, now + 0.38);
-    gain2.gain.exponentialRampToValueAtTime(0.001, now + 1.15);
-    osc2.connect(gain2);
-    gain2.connect(ctx.destination);
-    osc2.start(now + 0.35);
-    osc2.stop(now + 1.2);
-
-    setTimeout(() => {
-      ctx.close().catch(() => {});
-    }, 1500);
-  } catch {
-    // Ignorar bloqueo de autoplay si ocurre en navegador sin interacción previa
-  }
-}
-
-/**
- * Anuncia el turno en voz alta en español usando el motor nativo del TV/navegador
- */
-function speakTicketCall(ticket: string, destination: string) {
-  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
-  try {
-    window.speechSynthesis.cancel();
-
-    // Si es un código corto (ej: "A-014") antepone "Turno", si es nombre lo lee directo
-    const isCode = /^[A-Z]{0,3}-?\d{1,4}$/i.test(ticket.trim());
-    const spokenTicket = ticket.replace('-', ' ');
-    const phrase = isCode
-      ? `Turno ${spokenTicket}, ${destination}`
-      : `${spokenTicket}, ${destination}`;
-
-    const utterance = new SpeechSynthesisUtterance(phrase);
-    utterance.lang = 'es-AR';
-    utterance.rate = 0.95;
-    utterance.pitch = 1.0;
-
-    // Esperar 650ms para que suene primero el timbre "ding-dong"
-    setTimeout(() => {
-      window.speechSynthesis.speak(utterance);
-    }, 650);
-  } catch {
-    // Silenciar errores si el dispositivo no tiene voces instaladas
-  }
-}
-
-export default function PlayerPage() {
+export default function LlamadorPage() {
+  // Vinculación con el televisor
   const [screenId, setScreenId] = useState<string>('');
   const [screen, setScreen] = useState<(Screen & { id: string }) | null>(null);
-  const [items, setItems] = useState<MediaItem[]>([]);
-  const [currentIndex, setCurrentIndex] = useState<number>(0);
+  const [codeInput, setCodeInput] = useState<string>('');
+  const [isConnecting, setIsConnecting] = useState<boolean>(false);
+  const [booting, setBooting] = useState<boolean>(true);
 
-  // Transición suave entre spots
-  const [outgoingItem, setOutgoingItem] = useState<MediaItem | null>(null);
-  const [outgoingFading, setOutgoingFading] = useState<boolean>(false);
-  const lastItemRef = useRef<MediaItem | null>(null);
+  // Modo de operación: 'numeric' (Farmacia / Caja) | 'patient' (Clínica / Consultorio)
+  const [mode, setMode] = useState<'numeric' | 'patient'>('numeric');
 
-  // Control de anuncios del llamador
-  const [callFlash, setCallFlash] = useState<boolean>(false);
-  const lastCallSignatureRef = useRef<string>('');
-  const isFirstCallSnapshotRef = useRef<boolean>(true);
+  // Controles Modo Numérico
+  const [prefix, setPrefix] = useState<string>('A');
+  const [currentNumber, setCurrentNumber] = useState<number>(0);
+  const [counterStation, setCounterStation] = useState<string>('CAJA 1');
 
-  const [bootError, setBootError] = useState<string>('');
+  // Controles Modo Paciente / Consultorio
+  const [patientName, setPatientName] = useState<string>('');
+  const [consultingRoom, setConsultingRoom] = useState<string>('CONSULTORIO 1');
 
-  // 1. Registrar o recuperar identidad del televisor en Firestore
+  // Audio / Voz en el TV
+  const [voiceEnabled, setVoiceEnabled] = useState<boolean>(true);
+
+  // Feedback visual
+  const [statusToast, setStatusToast] = useState<{ type: 'ok' | 'err'; text: string } | null>(
+    null
+  );
+  const [isSending, setIsSending] = useState<boolean>(false);
+
+  const notify = (type: 'ok' | 'err', text: string) => {
+    setStatusToast({ type, text });
+    setTimeout(() => setStatusToast(null), 3500);
+  };
+
+  // Recuperar pantalla guardada en este mostrador
   useEffect(() => {
-    let cancelled = false;
-
-    async function initDevice() {
-      try {
-        const savedScreenId = localStorage.getItem(STORAGE_SCREEN_ID);
-        let deviceToken = localStorage.getItem(STORAGE_DEVICE_TOKEN);
-
-        if (!deviceToken) {
-          deviceToken = generateDeviceToken();
-          localStorage.setItem(STORAGE_DEVICE_TOKEN, deviceToken);
-        }
-
-        if (savedScreenId) {
-          if (!cancelled) setScreenId(savedScreenId);
-          return;
-        }
-
-        const newCode = generatePairingCode();
-        const initialTelemetry: ScreenTelemetry = {
-          lastSeen: Date.now(),
-          isNetworkOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
-          currentItemTitle: 'Esperando vinculación',
-          cachedItemsCount: 0,
-          appVersion: APP_VERSION,
-        };
-
-        const docRef = await addDoc(collection(db, 'screens'), {
-          pairingCode: newCode,
-          deviceToken,
-          name: 'Nueva Pantalla',
-          channelId: '',
-          isPaired: false,
-          rotation: 0,
-          command: 'playing',
-          callerEnabled: false,
-          telemetry: initialTelemetry,
-          lastSeen: Date.now(),
-          currentStatus: 'Esperando vinculación',
-        });
-
-        localStorage.setItem(STORAGE_SCREEN_ID, docRef.id);
-        if (!cancelled) setScreenId(docRef.id);
-      } catch {
-        if (!cancelled) {
-          setBootError('Error conectando con el servidor. Reintentando...');
-        }
-      }
+    const savedId = localStorage.getItem(STORAGE_SCREEN_ID_KEY);
+    if (savedId) {
+      setScreenId(savedId);
     }
-
-    initDevice();
-    return () => {
-      cancelled = true;
-    };
+    setBooting(false);
   }, []);
 
-  // 2. Escuchar cambios en tiempo real de este televisor (canal, comandos, rotación, llamador)
+  // Escuchar en tiempo real el televisor vinculado
   useEffect(() => {
-    if (!screenId) return;
+    if (!screenId) {
+      setScreen(null);
+      return;
+    }
 
     const unsub = onSnapshot(
       doc(db, 'screens', screenId),
       (snap) => {
         if (!snap.exists()) {
-          // Si fue eliminada desde el panel, limpiar y regenerar
-          localStorage.removeItem(STORAGE_SCREEN_ID);
+          localStorage.removeItem(STORAGE_SCREEN_ID_KEY);
           setScreenId('');
           setScreen(null);
           return;
@@ -206,420 +84,590 @@ export default function PlayerPage() {
 
         const data = { ...(snap.data() as Screen), id: snap.id };
         setScreen(data);
-        setBootError('');
 
-        // Detectar nuevo llamado de turno
-        const currentCall = data.callerState?.current;
-        const updatedAt = data.callerState?.updatedAt || currentCall?.timestamp || 0;
-        const signature = currentCall ? `${currentCall.id}_${updatedAt}` : '';
-
-        if (isFirstCallSnapshotRef.current) {
-          isFirstCallSnapshotRef.current = false;
-          lastCallSignatureRef.current = signature;
-        } else if (
-          data.callerEnabled &&
-          currentCall &&
-          signature &&
-          signature !== lastCallSignatureRef.current
-        ) {
-          lastCallSignatureRef.current = signature;
-          setCallFlash(true);
-          setTimeout(() => setCallFlash(false), 4000);
-
-          playDoorbellChime();
-          if (data.callerState?.voiceEnabled !== false) {
-            speakTicketCall(currentCall.ticket, currentCall.destination);
+        if (data.callerState) {
+          if (typeof data.callerState.lastNumber === 'number') {
+            setCurrentNumber(data.callerState.lastNumber);
+          }
+          if (typeof data.callerState.prefix === 'string') {
+            setPrefix(data.callerState.prefix);
+          }
+          if (data.callerState.defaultDestination) {
+            setCounterStation(data.callerState.defaultDestination);
+          }
+          if (typeof data.callerState.voiceEnabled === 'boolean') {
+            setVoiceEnabled(data.callerState.voiceEnabled);
           }
         }
       },
       () => {
-        // Si cae la red temporalmente, mantiene el estado actual en memoria
+        notify('err', 'Error de conexión con el televisor');
       }
     );
 
     return () => unsub();
   }, [screenId]);
 
-  // 3. Escuchar canal asignado (con respaldo en localStorage para modo offline)
-  const channelId = screen?.channelId || '';
+  // Vincular mostrador con el código de 6 dígitos del TV
+  const handleConnectScreen = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanCode = codeInput.trim().toUpperCase();
+    if (!cleanCode) return;
 
-  useEffect(() => {
-    if (!channelId) {
-      setItems([]);
-      setCurrentIndex(0);
-      return;
-    }
-
-    const cacheKey = `signage_cached_channel_${channelId}`;
+    setIsConnecting(true);
     try {
-      const cachedRaw = localStorage.getItem(cacheKey);
-      if (cachedRaw) {
-        const parsed = JSON.parse(cachedRaw) as MediaItem[];
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setItems(parsed);
-        }
+      const q = query(collection(db, 'screens'), where('pairingCode', '==', cleanCode));
+      const snap = await getDocs(q);
+
+      if (snap.empty) {
+        notify('err', 'No existe ningún televisor con ese código');
+        return;
       }
+
+      const target = snap.docs[0];
+      localStorage.setItem(STORAGE_SCREEN_ID_KEY, target.id);
+      setScreenId(target.id);
+      setCodeInput('');
+      notify('ok', 'Mostrador vinculado al televisor');
     } catch {
-      // Ignorar error de lectura de caché
+      notify('err', 'Error al buscar el televisor');
+    } finally {
+      setIsConnecting(false);
     }
+  };
 
-    const unsub = onSnapshot(
-      doc(db, 'channels', channelId),
-      (snap) => {
-        if (!snap.exists()) {
-          setItems([]);
-          return;
-        }
-        const channelData = snap.data() as Channel;
-        const sorted = [...(channelData.items || [])].sort((a, b) => a.order - b.order);
-        setItems(sorted);
-        try {
-          localStorage.setItem(cacheKey, JSON.stringify(sorted));
-        } catch {
-          // Ignorar límite de almacenamiento
-        }
-      },
-      () => {
-        // Ante corte de red mantiene los items cargados desde localStorage
+  const handleDisconnect = () => {
+    localStorage.removeItem(STORAGE_SCREEN_ID_KEY);
+    setScreenId('');
+    setScreen(null);
+  };
+
+  // Enviar nuevo llamado a Firestore
+  const pushCall = useCallback(
+    async (
+      ticketText: string,
+      destinationText: string,
+      options?: {
+        isRecall?: boolean;
+        nextNumber?: number;
       }
-    );
+    ) => {
+      if (!screen || isSending) return;
+      const cleanTicket = ticketText.trim().toUpperCase();
+      const cleanDest = destinationText.trim().toUpperCase() || 'MOSTRADOR';
+      if (!cleanTicket) return;
 
-    return () => unsub();
-  }, [channelId]);
+      setIsSending(true);
+      try {
+        const now = Date.now();
+        const newEntry: CallerEntry = {
+          id: `${now}-${Math.random().toString(36).slice(2, 6)}`,
+          ticket: cleanTicket,
+          destination: cleanDest,
+          timestamp: now,
+        };
 
-  // 4. Loop continuo de reproducción
-  const safeIndex = items.length > 0 ? currentIndex % items.length : 0;
-  const activeItem = items[safeIndex] || null;
+        const prevCurrent = screen.callerState?.current || null;
+        const prevHistory = screen.callerState?.history || [];
 
-  useEffect(() => {
-    if (!screen?.isPaired || screen.command !== 'playing' || items.length === 0 || !activeItem) {
-      return;
-    }
+        const updatedHistory =
+          options?.isRecall || !prevCurrent
+            ? prevHistory
+            : [prevCurrent, ...prevHistory].slice(0, 5);
 
-    const durationMs = Math.max(activeItem.duration || 10, 2) * 1000;
-    const timer = setTimeout(() => {
-      setCurrentIndex((prev) => (prev + 1) % items.length);
-    }, durationMs);
+        const nextCallerState: CallerState = {
+          current: newEntry,
+          history: updatedHistory,
+          prefix: prefix.trim().toUpperCase(),
+          lastNumber:
+            typeof options?.nextNumber === 'number' ? options.nextNumber : currentNumber,
+          defaultDestination: cleanDest,
+          voiceEnabled,
+          updatedAt: now,
+        };
 
-    return () => clearTimeout(timer);
-  }, [screen?.isPaired, screen?.command, items.length, activeItem]);
+        await updateDoc(doc(db, 'screens', screen.id), {
+          callerState: nextCallerState,
+        });
 
-  // Transición suave (Crossfade 0.5s)
-  useEffect(() => {
-    const prev = lastItemRef.current;
-    if (prev && activeItem && prev.id !== activeItem.id) {
-      setOutgoingItem(prev);
-      setOutgoingFading(false);
+        if (typeof options?.nextNumber === 'number') {
+          setCurrentNumber(options.nextNumber);
+        }
+      } catch {
+        notify('err', 'No se pudo enviar el llamado al TV');
+      } finally {
+        setIsSending(false);
+      }
+    },
+    [screen, isSending, prefix, currentNumber, voiceEnabled]
+  );
 
-      const raf = requestAnimationFrame(() => {
-        setOutgoingFading(true);
-      });
-      const cleanup = setTimeout(() => {
-        setOutgoingItem(null);
-        setOutgoingFading(false);
-      }, 520);
+  // Acciones Modo Numérico (Farmacia / Caja)
+  const handleCallNextNumber = useCallback(() => {
+    const nextNum = currentNumber + 1;
+    const ticket = formatTicket(prefix, nextNum);
+    pushCall(ticket, counterStation, { nextNumber: nextNum });
+  }, [currentNumber, prefix, counterStation, pushCall]);
 
-      lastItemRef.current = activeItem;
-      return () => {
-        cancelAnimationFrame(raf);
-        clearTimeout(cleanup);
-      };
-    }
+  const handleCallPrevNumber = useCallback(() => {
+    const prevNum = Math.max(1, currentNumber - 1);
+    const ticket = formatTicket(prefix, prevNum);
+    pushCall(ticket, counterStation, { nextNumber: prevNum });
+  }, [currentNumber, prefix, counterStation, pushCall]);
 
-    lastItemRef.current = activeItem;
-  }, [activeItem]);
+  const handleRecallCurrent = useCallback(() => {
+    const current = screen?.callerState?.current;
+    if (!current) return;
+    pushCall(current.ticket, current.destination, { isRecall: true });
+    notify('ok', `Rellamando: ${current.ticket}`);
+  }, [screen, pushCall]);
 
-  // 5. Enviar latidos de telemetría a Firestore (para la Torre de Control)
-  const sendHeartbeat = useCallback(async () => {
-    if (!screenId) return;
+  // Acción Modo Paciente / Consultorio
+  const handleCallPatient = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!patientName.trim()) return;
+    pushCall(patientName, consultingRoom);
+    setPatientName('');
+  };
+
+  // Limpiar pantalla de turnos en el TV
+  const handleClearQueue = async () => {
+    if (!screen) return;
     try {
-      const now = Date.now();
-      const statusLabel = !screen?.isPaired
-        ? 'Esperando vinculación'
-        : screen.command === 'blackout'
-        ? 'Pantalla apagada'
-        : screen.command === 'paused'
-        ? 'Pausado'
-        : activeItem
-        ? `Emitiendo: ${activeItem.title}`
-        : 'Sin contenido';
-
-      const telemetry: ScreenTelemetry = {
-        lastSeen: now,
-        isNetworkOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
-        currentItemTitle: activeItem?.title || statusLabel,
-        ...(activeItem?.id ? { currentItemId: activeItem.id } : {}),
-        cachedItemsCount: items.length,
-        appVersion: APP_VERSION,
+      const resetState: CallerState = {
+        current: null,
+        history: [],
+        prefix: prefix.trim().toUpperCase(),
+        lastNumber: 0,
+        defaultDestination: counterStation.trim().toUpperCase(),
+        voiceEnabled,
+        updatedAt: Date.now(),
       };
-
-      await updateDoc(doc(db, 'screens', screenId), {
-        telemetry,
-        lastSeen: now,
-        currentStatus: statusLabel,
-        cachedCount: items.length,
+      await updateDoc(doc(db, 'screens', screen.id), {
+        callerState: resetState,
       });
+      setCurrentNumber(0);
+      notify('ok', 'Cola de turnos reiniciada a 0');
     } catch {
-      // Silenciar si momentáneamente no hay internet
+      notify('err', 'Error al limpiar los turnos');
     }
-  }, [screenId, screen?.isPaired, screen?.command, activeItem, items.length]);
+  };
 
+  // Atajos de teclado físico tipo Llamador Clásico (Teclado Numérico USB)
   useEffect(() => {
-    if (!screenId) return;
-    sendHeartbeat();
-    const interval = setInterval(sendHeartbeat, 25000);
-    return () => clearInterval(interval);
-  }, [screenId, sendHeartbeat]);
+    if (!screen || mode !== 'numeric') return;
 
-  // Pantalla de carga inicial o error de arranque
-  if (!screen) {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const isTyping =
+        target?.tagName === 'INPUT' ||
+        target?.tagName === 'TEXTAREA' ||
+        target?.tagName === 'SELECT';
+
+      if (e.code === 'NumpadAdd' || (!isTyping && (e.key === '+' || e.key === 'Enter'))) {
+        e.preventDefault();
+        handleCallNextNumber();
+      } else if (e.code === 'NumpadMultiply' || (!isTyping && e.key === '*')) {
+        e.preventDefault();
+        handleRecallCurrent();
+      } else if (e.code === 'NumpadSubtract' || (!isTyping && e.key === '-')) {
+        e.preventDefault();
+        handleCallPrevNumber();
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [screen, mode, handleCallNextNumber, handleRecallCurrent, handleCallPrevNumber]);
+
+  if (booting) {
     return (
-      <div className="w-screen h-screen bg-black text-neutral-400 flex flex-col items-center justify-center p-8 select-none">
-        <div className="w-8 h-8 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin mb-4" />
-        <p className="text-sm tracking-wide">
-          {bootError || 'Iniciando reproductor digital...'}
-        </p>
+      <div className="min-h-screen bg-neutral-950 text-neutral-400 flex items-center justify-center">
+        Iniciando terminal de turnos...
       </div>
     );
   }
 
-  // Pantalla sin vincular: muestra el código grande de 6 dígitos
-  if (!screen.isPaired) {
+  // Pantalla de vinculación inicial del mostrador
+  if (!screenId || !screen) {
     return (
-      <div className="w-screen h-screen bg-neutral-950 text-white flex flex-col items-center justify-center p-8 select-none">
-        <div className="max-w-md w-full bg-neutral-900 border border-neutral-800 rounded-3xl p-10 text-center space-y-6 shadow-2xl">
-          <span className="inline-block px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-semibold uppercase tracking-widest">
-            Pantalla Lista para Vincular
-          </span>
-
-          <div className="space-y-2">
-            <p className="text-sm text-neutral-400">
-              Ingresá este código en el Panel de Control o en el Llamador de Mostrador:
+      <div className="min-h-screen bg-neutral-950 text-white flex items-center justify-center p-6">
+        <form
+          onSubmit={handleConnectScreen}
+          className="w-full max-w-sm bg-neutral-900 border border-neutral-800 rounded-2xl p-8 shadow-2xl space-y-5"
+        >
+          <div>
+            <span className="inline-block px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium mb-2">
+              Terminal de Mostrador
+            </span>
+            <h1 className="text-2xl font-bold">Llamador de Turnos</h1>
+            <p className="text-sm text-neutral-400 mt-1">
+              Ingresá el código de 6 dígitos del televisor donde querés emitir los llamados.
             </p>
-            <div className="bg-black border-2 border-neutral-800 rounded-2xl py-6 px-4">
-              <span className="text-5xl md:text-6xl font-black font-mono tracking-[0.25em] text-emerald-400">
-                {screen.pairingCode}
-              </span>
-            </div>
           </div>
 
-          <p className="text-xs text-neutral-500">
-            Esperando asignación desde el panel...
-          </p>
-        </div>
+          <input
+            type="text"
+            maxLength={6}
+            value={codeInput}
+            onChange={(e) => setCodeInput(e.target.value)}
+            placeholder="EJ: A1B2C3"
+            className="w-full bg-neutral-950 border border-neutral-700 rounded-xl px-4 py-3.5 text-center text-xl font-mono tracking-widest uppercase focus:outline-none focus:border-emerald-500"
+            autoFocus
+          />
+
+          <button
+            type="submit"
+            disabled={isConnecting}
+            className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-3 rounded-xl transition"
+          >
+            {isConnecting ? 'Conectando...' : 'Conectar con Televisor'}
+          </button>
+
+          {statusToast && (
+            <p
+              className={`text-center text-sm ${
+                statusToast.type === 'ok' ? 'text-emerald-400' : 'text-red-400'
+              }`}
+            >
+              {statusToast.text}
+            </p>
+          )}
+        </form>
       </div>
     );
   }
 
-  // Comando Blackout (pantalla en negro)
-  if (screen.command === 'blackout') {
-    return <div className="w-screen h-screen bg-black cursor-none select-none" />;
-  }
+  const theme = getCallerTheme(screen.callerTheme);
+  const isLight = screen.callerTheme === 'editorial';
+  const activeCall = screen.callerState?.current || null;
+  const callHistory = screen.callerState?.history || [];
 
-  const rotation = screen.rotation || 0;
-  const isVerticalRotation = rotation === 90 || rotation === 270;
-  const callerEnabled = Boolean(screen.callerEnabled);
-  const currentCall = screen.callerState?.current || null;
-  const callHistory = (screen.callerState?.history || []).slice(0, 4);
+  const innerBox = isLight
+    ? 'bg-white/80 border-[#DCD6CA]'
+    : 'bg-black/40 border-white/10';
+  const inputStyle = isLight
+    ? 'bg-white border-[#DCD6CA] text-[#1A1A1A] placeholder:text-neutral-400'
+    : 'bg-black/60 border-white/15 text-white placeholder:text-neutral-500';
+  const mutedText = isLight ? 'text-[#6E6A63]' : 'text-neutral-400';
 
   return (
-    <div className="w-screen h-screen bg-black overflow-hidden flex items-center justify-center cursor-none select-none">
-      {/* Contenedor rotado según configuración del TV (0°, 90°, 180°, 270°) */}
-      <div
-        style={{
-          width: isVerticalRotation ? '100vh' : '100vw',
-          height: isVerticalRotation ? '100vw' : '100vh',
-          transform: `rotate(${rotation}deg)`,
-        }}
-        className={`shrink-0 bg-black flex ${
-          isVerticalRotation ? 'flex-col' : 'flex-row'
-        } overflow-hidden`}
-      >
-        {/* ZONA PRINCIPAL: PUBLICIDADES (100% normal o 72% si el llamador está activo) */}
-        <div
-          className={`relative bg-black flex items-center justify-center overflow-hidden ${
-            callerEnabled
-              ? isVerticalRotation
-                ? 'w-full h-[68%]'
-                : 'w-[72%] h-full'
-              : 'w-full h-full'
-          }`}
+    <div className={`min-h-screen ${theme.callerPageBg} p-4 md:p-8 transition-colors duration-300`}>
+      <div className="max-w-5xl mx-auto space-y-6">
+        {/* Cabecera */}
+        <header
+          className={`flex flex-wrap items-center justify-between gap-4 ${theme.callerCardBg} border ${theme.callerCardBorder} rounded-2xl p-4 md:p-5`}
         >
-          {!activeItem ? (
-            <div className="text-center px-6 space-y-2">
-              <p className="text-lg font-medium text-neutral-500">{screen.name}</p>
-              <p className="text-xs text-neutral-600">
-                {channelId
-                  ? 'El canal asignado todavía no tiene anuncios publicados.'
-                  : 'Pantalla vinculada. Asignale un canal desde el panel.'}
-              </p>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className={`w-2.5 h-2.5 rounded-full ${theme.playerDot} animate-pulse`} />
+              <span className={`text-xs font-semibold uppercase tracking-wider ${theme.callerAccentText}`}>
+                Conectado a TV: {screen.name}
+              </span>
+              <span className={`text-xs font-mono ${mutedText}`}>({screen.pairingCode})</span>
             </div>
-          ) : (
-            <>
-              {/* Spot entrante */}
-              <div className="absolute inset-0 flex items-center justify-center">
-                {activeItem.type === 'image' && (
-                  <img
-                    key={`in-${activeItem.id}`}
-                    src={activeItem.url}
-                    alt={activeItem.title}
-                    className="w-full h-full object-contain"
-                  />
-                )}
+            <h1 className="text-xl font-bold mt-1">Consola de Llamado al Público</h1>
+          </div>
 
-                {activeItem.type === 'video' && (
-                  <video
-                    key={`in-${activeItem.id}`}
-                    src={activeItem.url}
-                    autoPlay={screen.command === 'playing'}
-                    muted
-                    loop
-                    playsInline
-                    className="w-full h-full object-contain"
-                  />
-                )}
+          <div className="flex items-center gap-2.5">
+            <label
+              className={`flex items-center gap-2 ${innerBox} border px-3 py-2 rounded-xl text-xs cursor-pointer`}
+            >
+              <input
+                type="checkbox"
+                checked={voiceEnabled}
+                onChange={(e) => setVoiceEnabled(e.target.checked)}
+                className="accent-emerald-500"
+              />
+              <span>Voz + Timbre en TV</span>
+            </label>
 
-                {activeItem.type === 'youtube' && activeItem.youtubeId && (
-                  <iframe
-                    key={`in-${activeItem.id}`}
-                    className="w-full h-full pointer-events-none"
-                    src={`https://www.youtube.com/embed/${activeItem.youtubeId}?autoplay=${
-                      screen.command === 'playing' ? 1 : 0
-                    }&mute=1&loop=1&playlist=${
-                      activeItem.youtubeId
-                    }&controls=0&rel=0&modestbranding=1&playsinline=1`}
-                    title={activeItem.title}
-                    allow="autoplay; encrypted-media"
-                  />
-                )}
-              </div>
+            <button
+              type="button"
+              onClick={handleDisconnect}
+              className={`${innerBox} hover:opacity-80 border px-3.5 py-2 rounded-xl text-xs transition`}
+            >
+              Cambiar TV
+            </button>
+          </div>
+        </header>
 
-              {/* Spot saliente con fundido suave */}
-              {outgoingItem && (
-                <div
-                  className={`absolute inset-0 bg-black flex items-center justify-center pointer-events-none transition-opacity duration-500 ${
-                    outgoingFading ? 'opacity-0' : 'opacity-100'
-                  }`}
-                >
-                  {outgoingItem.type === 'image' && (
-                    <img
-                      src={outgoingItem.url}
-                      alt={outgoingItem.title}
-                      className="w-full h-full object-contain"
-                    />
-                  )}
-                  {outgoingItem.type === 'video' && (
-                    <video
-                      src={outgoingItem.url}
-                      muted
-                      playsInline
-                      className="w-full h-full object-contain"
-                    />
-                  )}
-                </div>
-              )}
-            </>
-          )}
-
-          {/* Indicador sutil si está pausada desde el panel */}
-          {screen.command === 'paused' && (
-            <div className="absolute top-4 left-4 bg-black/75 border border-amber-500/40 text-amber-300 px-3 py-1 rounded-full text-xs font-semibold">
-              ⏸ Pausa
-            </div>
-          )}
-        </div>
-
-        {/* ZONA SECUNDARIA (L-BAR): COLUMNA DE TURNOS EN VIVO */}
-        {callerEnabled && (
-          <aside
-            className={`bg-neutral-950 flex flex-col justify-between p-5 ${
-              isVerticalRotation
-                ? 'w-full h-[32%] border-t-2 border-neutral-800'
-                : 'w-[28%] h-full border-l-2 border-neutral-800'
+        {/* Aviso si el modo llamador todavía está apagado en el panel */}
+        {!screen.callerEnabled && (
+          <div
+            className={`px-4 py-3 rounded-xl text-xs md:text-sm border ${
+              isLight
+                ? 'bg-amber-100 border-amber-300 text-amber-950'
+                : 'bg-amber-500/10 border-amber-500/30 text-amber-200'
             }`}
           >
-            {/* Cabecera de Turnos */}
-            <div className="flex items-center justify-between border-b border-neutral-800 pb-3">
-              <div className="flex items-center gap-2">
-                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
-                <span className="text-xs md:text-sm font-bold uppercase tracking-[0.2em] text-neutral-300">
-                  Turnos
-                </span>
-              </div>
-              <span className="text-[11px] font-mono text-neutral-500">
-                {screen.pairingCode}
-              </span>
+            ⚠️ <strong>Aviso:</strong> Este televisor tiene la columna de turnos oculta. Activala
+            en el panel principal tocando el botón <strong>&ldquo;🔕 OFF&rdquo;</strong> en la
+            tarjeta de <strong>{screen.name}</strong>.
+          </div>
+        )}
+
+        {statusToast && (
+          <div
+            className={`px-4 py-2.5 rounded-xl text-sm font-medium border ${
+              statusToast.type === 'ok'
+                ? isLight
+                  ? 'bg-emerald-100 border-emerald-300 text-emerald-900'
+                  : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                : isLight
+                ? 'bg-red-100 border-red-300 text-red-900'
+                : 'bg-red-500/10 border-red-500/30 text-red-300'
+            }`}
+          >
+            {statusToast.text}
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          {/* Columna Izquierda: Botonera de Llamado */}
+          <section
+            className={`lg:col-span-7 ${theme.callerCardBg} border ${theme.callerCardBorder} rounded-2xl p-6 space-y-6`}
+          >
+            {/* Selector de Modo */}
+            <div className={`grid grid-cols-2 gap-2 ${innerBox} p-1.5 rounded-xl border`}>
+              <button
+                type="button"
+                onClick={() => setMode('numeric')}
+                className={`py-2.5 rounded-lg text-xs sm:text-sm font-semibold transition ${
+                  mode === 'numeric'
+                    ? theme.callerPrimaryBtn
+                    : `${mutedText} hover:opacity-80`
+                }`}
+              >
+                🔢 Turno Numérico (Farmacia)
+              </button>
+              <button
+                type="button"
+                onClick={() => setMode('patient')}
+                className={`py-2.5 rounded-lg text-xs sm:text-sm font-semibold transition ${
+                  mode === 'patient'
+                    ? theme.callerPrimaryBtn
+                    : `${mutedText} hover:opacity-80`
+                }`}
+              >
+                🩺 Por Nombre (Clínica)
+              </button>
             </div>
 
-            {/* Tarjeta del Llamado Actual */}
-            <div
-              className={`my-auto rounded-2xl p-5 text-center transition-all duration-500 border-2 ${
-                callFlash
-                  ? 'bg-emerald-500 border-white text-black scale-[1.02] shadow-[0_0_45px_rgba(16,185,129,0.65)]'
-                  : 'bg-neutral-900 border-emerald-500/50 text-white'
-              }`}
-            >
-              {currentCall ? (
-                <div className="space-y-2">
-                  <p
-                    className={`text-xs font-bold uppercase tracking-widest ${
-                      callFlash ? 'text-black/80' : 'text-emerald-400'
-                    }`}
-                  >
-                    Llamando Ahora
-                  </p>
-                  <p className="text-4xl xl:text-5xl font-black tracking-tight break-words leading-tight">
-                    {currentCall.ticket}
-                  </p>
-                  <div
-                    className={`inline-block mt-1 px-4 py-1.5 rounded-xl text-base xl:text-xl font-extrabold uppercase tracking-wide ${
-                      callFlash
-                        ? 'bg-black text-emerald-400'
-                        : 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
-                    }`}
-                  >
-                    {currentCall.destination}
+            {mode === 'numeric' ? (
+              <div className="space-y-5">
+                {/* Configuración de Letra, Puesto y Número manual */}
+                <div className={`grid grid-cols-3 gap-3 ${innerBox} border rounded-xl p-4`}>
+                  <div>
+                    <label className={`block text-[11px] ${mutedText} mb-1`}>
+                      Letra / Fila
+                    </label>
+                    <input
+                      type="text"
+                      maxLength={3}
+                      value={prefix}
+                      onChange={(e) => setPrefix(e.target.value.toUpperCase())}
+                      placeholder="A"
+                      className={`w-full ${inputStyle} border rounded-lg px-3 py-2 text-sm font-mono uppercase text-center`}
+                    />
+                  </div>
+
+                  <div>
+                    <label className={`block text-[11px] ${mutedText} mb-1`}>
+                      Puesto / Caja
+                    </label>
+                    <input
+                      type="text"
+                      value={counterStation}
+                      onChange={(e) => setCounterStation(e.target.value)}
+                      placeholder="CAJA 1"
+                      className={`w-full ${inputStyle} border rounded-lg px-3 py-2 text-sm uppercase`}
+                    />
+                  </div>
+
+                  <div>
+                    <label className={`block text-[11px] ${mutedText} mb-1`}>
+                      N° Actual
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={9999}
+                      value={currentNumber}
+                      onChange={(e) => setCurrentNumber(Math.max(0, Number(e.target.value)))}
+                      className={`w-full ${inputStyle} border rounded-lg px-3 py-2 text-sm font-mono text-center`}
+                    />
                   </div>
                 </div>
-              ) : (
-                <div className="py-6 space-y-1">
-                  <p className="text-sm font-medium text-neutral-400">
-                    Sala de Espera
-                  </p>
-                  <p className="text-xs text-neutral-600">
-                    Aguardando próximo llamado
-                  </p>
+
+                {/* Botón Gigante Llamar Siguiente */}
+                <button
+                  type="button"
+                  onClick={handleCallNextNumber}
+                  disabled={isSending}
+                  className={`w-full ${theme.callerPrimaryBtn} active:scale-[0.99] rounded-2xl py-7 px-6 shadow-xl transition flex flex-col items-center justify-center gap-1`}
+                >
+                  <span className="text-xs uppercase tracking-widest opacity-85">
+                    Llamar Siguiente (Tecla + o Enter)
+                  </span>
+                  <span className="text-3xl md:text-4xl font-black tracking-tight">
+                    {formatTicket(prefix, currentNumber + 1)} →{' '}
+                    {counterStation.trim().toUpperCase() || 'MOSTRADOR'}
+                  </span>
+                </button>
+
+                {/* Botones secundarios tipo llamador clásico */}
+                <div className="grid grid-cols-2 gap-3">
+                  <button
+                    type="button"
+                    onClick={handleRecallCurrent}
+                    disabled={!activeCall || isSending}
+                    className={`disabled:opacity-40 border font-semibold py-3.5 px-4 rounded-xl text-sm transition ${
+                      isLight
+                        ? 'bg-amber-100 hover:bg-amber-200 border-amber-300 text-amber-950'
+                        : 'bg-amber-600/20 hover:bg-amber-600/30 border-amber-500/40 text-amber-200'
+                    }`}
+                  >
+                    🔔 Rellamar Actual (Tecla *)
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleCallPrevNumber}
+                    disabled={currentNumber <= 1 || isSending}
+                    className={`${innerBox} hover:opacity-80 disabled:opacity-40 border font-medium py-3.5 px-4 rounded-xl text-sm transition`}
+                  >
+                    ← Número Anterior (Tecla -)
+                  </button>
                 </div>
-              )}
+              </div>
+            ) : (
+              <form onSubmit={handleCallPatient} className="space-y-4">
+                <div className={`space-y-3 ${innerBox} border rounded-xl p-4`}>
+                  <div>
+                    <label className={`block text-xs ${mutedText} mb-1`}>
+                      Nombre y Apellido del Paciente
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={patientName}
+                      onChange={(e) => setPatientName(e.target.value)}
+                      placeholder="Ej: María Gómez"
+                      className={`w-full ${inputStyle} border rounded-xl px-4 py-3 text-base focus:outline-none`}
+                    />
+                  </div>
+
+                  <div>
+                    <label className={`block text-xs ${mutedText} mb-1`}>
+                      Consultorio / Box / Sector
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={consultingRoom}
+                      onChange={(e) => setConsultingRoom(e.target.value)}
+                      placeholder="Ej: CONSULTORIO 4"
+                      className={`w-full ${inputStyle} border rounded-xl px-4 py-3 text-sm uppercase focus:outline-none`}
+                    />
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={isSending || !patientName.trim()}
+                  className={`w-full ${theme.callerPrimaryBtn} disabled:opacity-40 font-bold py-4 rounded-xl text-base shadow-lg transition`}
+                >
+                  📢 Llamar Paciente en Pantalla
+                </button>
+
+                {activeCall && (
+                  <button
+                    type="button"
+                    onClick={handleRecallCurrent}
+                    className={`w-full border font-semibold py-3 rounded-xl text-sm transition ${
+                      isLight
+                        ? 'bg-amber-100 hover:bg-amber-200 border-amber-300 text-amber-950'
+                        : 'bg-amber-600/20 hover:bg-amber-600/30 border-amber-500/40 text-amber-200'
+                    }`}
+                  >
+                    🔔 Rellamar a {activeCall.ticket}
+                  </button>
+                )}
+              </form>
+            )}
+          </section>
+
+          {/* Columna Derecha: Lo que está viendo el público ahora */}
+          <section
+            className={`lg:col-span-5 ${theme.callerCardBg} border ${theme.callerCardBorder} rounded-2xl p-6 flex flex-col justify-between gap-6`}
+          >
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className={`text-sm font-semibold uppercase tracking-wider ${mutedText}`}>
+                  En Pantalla Ahora
+                </h2>
+                <button
+                  type="button"
+                  onClick={handleClearQueue}
+                  className={`text-xs ${mutedText} hover:text-red-500 transition`}
+                >
+                  Reiniciar cola
+                </button>
+              </div>
+
+              <div
+                className={`${innerBox} border-2 ${theme.callerActiveBorder} rounded-2xl p-6 text-center space-y-2`}
+              >
+                {activeCall ? (
+                  <>
+                    <span
+                      className={`inline-block text-[11px] font-bold uppercase tracking-widest px-2.5 py-0.5 rounded-full ${theme.callerAccentText}`}
+                    >
+                      Turno Actual
+                    </span>
+                    <p className="text-4xl font-black tracking-tight">{activeCall.ticket}</p>
+                    <p className={`text-lg font-bold ${theme.callerAccentText}`}>
+                      {activeCall.destination}
+                    </p>
+                  </>
+                ) : (
+                  <p className={`text-sm ${mutedText} py-6`}>
+                    Todavía no se llamó ningún turno
+                  </p>
+                )}
+              </div>
+
+              {/* Últimos llamados */}
+              <div className="space-y-2 pt-2">
+                <h3 className={`text-xs font-medium ${mutedText}`}>Últimos llamados</h3>
+                {callHistory.length === 0 ? (
+                  <p className={`text-xs ${mutedText}`}>Sin historial reciente</p>
+                ) : (
+                  <ul className="space-y-1.5">
+                    {callHistory.map((item) => (
+                      <li
+                        key={item.id}
+                        className={`flex items-center justify-between ${innerBox} border rounded-xl px-3.5 py-2 text-xs`}
+                      >
+                        <span className="font-bold">{item.ticket}</span>
+                        <span className={`font-semibold ${theme.callerAccentText}`}>
+                          {item.destination}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
             </div>
 
-            {/* Historial reciente de llamados */}
-            <div className="border-t border-neutral-800 pt-3 space-y-2">
-              <p className="text-[11px] font-semibold uppercase tracking-wider text-neutral-500">
-                Últimos llamados
-              </p>
-              {callHistory.length === 0 ? (
-                <p className="text-xs text-neutral-600">—</p>
-              ) : (
-                <ul className="space-y-1.5">
-                  {callHistory.map((entry) => (
-                    <li
-                      key={entry.id}
-                      className="flex items-center justify-between gap-2 bg-neutral-900/90 border border-neutral-800/80 rounded-xl px-3 py-2 text-xs xl:text-sm"
-                    >
-                      <span className="font-bold text-neutral-200 truncate">
-                        {entry.ticket}
-                      </span>
-                      <span className="font-semibold text-emerald-400 shrink-0">
-                        {entry.destination}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              )}
+            <div className={`${innerBox} border rounded-xl p-3.5 text-[11px] ${mutedText} leading-relaxed`}>
+              💡 <strong>Tip de mostrador:</strong> Podés usar un teclado numérico USB común.
+              Apretá <strong>+</strong> para avanzar turno y <strong>*</strong> para volver a
+              tocar el timbre.
             </div>
-          </aside>
-        )}
+          </section>
+        </div>
       </div>
     </div>
   );
